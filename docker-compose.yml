@@ -1,0 +1,78 @@
+services:
+
+  # ── PostgreSQL with pgvector ────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: llm0_postgres
+    environment:
+      POSTGRES_USER: llm0
+      POSTGRES_PASSWORD: llm0_password
+      POSTGRES_DB: llm0_gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llm0 -d llm0_gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: llm0_redis
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Embedding Service (semantic caching) ────────────────────────────────────
+  # Serves all-MiniLM-L6-v2 (384-dim) embeddings over HTTP.
+  # The model (~90MB) is baked into the image at build time so startup is fast.
+  # First build takes ~3-5 minutes while it downloads the model weights.
+  # RAM: ~300MB. CPU-only — no GPU required.
+  embedding:
+    build:
+      context: ./embedding_service
+      dockerfile: Dockerfile
+    container_name: llm0_embedding
+    ports:
+      - "8001:8080"   # http://localhost:8001/embed  (external access for debugging)
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s   # model loading takes ~10-30s on first start
+
+  # ── LLM0 Gateway ────────────────────────────────────────────────────────────
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm0_gateway
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://llm0:llm0_password@postgres:5432/llm0_gateway?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      EMBEDDING_SERVICE_URL: http://embedding:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      embedding:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

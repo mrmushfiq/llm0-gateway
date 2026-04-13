@@ -1,0 +1,344 @@
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/sashabaranov/go-openai"
+
+	"github.com/mrmushfiq/llm0-gateway/internal/gateway/auth"
+	"github.com/mrmushfiq/llm0-gateway/internal/gateway/providers"
+	"github.com/mrmushfiq/llm0-gateway/internal/gateway/streaming"
+	"github.com/mrmushfiq/llm0-gateway/internal/shared/models"
+)
+
+// ChatCompletionsStream handles streaming chat completion requests
+func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
+	startTime := time.Now()
+
+	// Get validated API key from auth middleware
+	apiKey, ok := auth.GetAPIKey(c)
+	if !ok {
+		c.JSON(500, gin.H{"error": "internal_error", "message": "API key not found in context"})
+		return
+	}
+
+	// Get pre-parsed request from context (set by main handler)
+	reqInterface, exists := c.Get("parsed_request")
+	if !exists {
+		c.JSON(500, gin.H{"error": "internal_error", "message": "Request not found in context"})
+		return
+	}
+
+	req, ok := reqInterface.(providers.ChatRequest)
+	if !ok {
+		c.JSON(500, gin.H{"error": "internal_error", "message": "Invalid request type"})
+		return
+	}
+
+	// Validate that streaming is enabled
+	if !req.Stream {
+		c.JSON(400, gin.H{"error": "invalid_request", "message": "Stream must be true"})
+		return
+	}
+
+	// Detect provider and validate model
+	providerName, provider := h.detectProvider(req.Model)
+	if provider == nil {
+		c.JSON(400, gin.H{"error": "invalid_model", "message": fmt.Sprintf("Model %s is not supported", req.Model)})
+		return
+	}
+
+	fmt.Printf("⚡ Streaming request: %s via %s\n", req.Model, providerName)
+
+	ctx := c.Request.Context()
+
+	// Extract customer ID and labels for tracking
+	customerID := c.GetHeader("X-Customer-ID")
+	var customerLabels models.Labels
+	if customerID != "" {
+		customerLabels = make(models.Labels)
+		for key, values := range c.Request.Header {
+			if len(key) > 7 && key[:7] == "X-Llm0-" {
+				labelKey := key[7:]
+				if len(values) > 0 {
+					customerLabels[labelKey] = values[0]
+				}
+			}
+		}
+	}
+
+	// Step 1: Check rate limit
+	rateLimitKey := fmt.Sprintf("ratelimit:key:%s", apiKey.KeyID)
+	allowed, remaining, resetTime, err := h.redis.CheckRateLimit(
+		ctx,
+		rateLimitKey,
+		apiKey.RateLimitPerMinute,
+		apiKey.RateLimitPerMinute,
+		1,
+	)
+
+	if err != nil {
+		fmt.Printf("⚠️ Rate limit check failed: %v (fail-open)\n", err)
+	} else if !allowed {
+		c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", apiKey.RateLimitPerMinute))
+		c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
+		c.Header("X-RateLimit-Reset", fmt.Sprintf("%d", resetTime))
+		c.JSON(429, gin.H{
+			"error":       "rate_limit_exceeded",
+			"message":     "Too many requests. Please try again later.",
+			"retry_after": resetTime,
+		})
+		return
+	}
+
+	// Step 2: Check cache (if cache hit, return full response - no streaming)
+	if apiKey.CacheEnabled {
+		cacheKey, err := h.exactCache.CacheKey(apiKey.ProjectID, providerName, req.Model, req.Messages)
+		if err == nil {
+			cachedResponse, hit, err := h.exactCache.Get(ctx, cacheKey)
+			if err != nil {
+				fmt.Printf("⚠️ Cache check failed: %v\n", err)
+			}
+			if hit {
+				fmt.Println("✅ Cache HIT - returning full response (not streaming)")
+				// Return cached response immediately (not streaming)
+				// Cache hits cost $0 since we're not calling the LLM API
+				cachedResponse.LatencyMs = int(time.Since(startTime).Milliseconds())
+				cachedResponse.CostUSD = 0 // Cache hits are free
+				c.Header("X-Cache-Hit", "exact")
+				c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
+				c.Header("X-Cost-USD", "0.000000") // Cache hits cost $0
+				c.Header("X-Tokens-Prompt", fmt.Sprintf("%d", cachedResponse.Usage.PromptTokens))
+				c.Header("X-Tokens-Completion", fmt.Sprintf("%d", cachedResponse.Usage.CompletionTokens))
+				c.Header("X-Tokens-Total", fmt.Sprintf("%d", cachedResponse.Usage.TotalTokens))
+				c.Header("X-Provider", providerName)
+				c.JSON(200, cachedResponse)
+				return
+			}
+		}
+	}
+
+	// Step 3: Check spend cap BEFORE streaming
+	spendKey := fmt.Sprintf("spend:project:%s:%s", apiKey.ProjectID, time.Now().Format("2006-01"))
+	estimatedTokens := 1000
+	estimatedCost, err := h.costCalculator.EstimateCost(providerName, req.Model, estimatedTokens)
+	if err != nil {
+		fmt.Printf("⚠️ Cost estimation failed: %v\n", err)
+		estimatedCost = 0.10
+	}
+
+	canAfford, currentSpend, cap, err := h.redis.CheckSpendCap(ctx, spendKey, estimatedCost, apiKey.MonthlyCap)
+	if err != nil {
+		fmt.Printf("⚠️ Spend cap check failed: %v (fail-open)\n", err)
+	} else if !canAfford {
+		c.JSON(402, gin.H{
+			"error":         "spend_cap_exceeded",
+			"message":       "Monthly spend cap reached",
+			"current_spend": currentSpend,
+			"monthly_cap":   cap,
+		})
+		return
+	}
+
+	// Step 4: Set SSE headers
+	streaming.SetSSEHeaders(c)
+	c.Header("X-Cache-Hit", "miss")
+	c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
+	c.Header("X-Provider", providerName)
+
+	// Step 5: Start streaming based on provider
+	type StreamReader interface {
+		Recv() (openai.ChatCompletionStreamResponse, error)
+		Close() error
+	}
+
+	var stream StreamReader
+	var streamErr error
+
+	switch providerName {
+	case "openai":
+		stream, streamErr = h.openaiProvider.ChatCompletionStream(ctx, req)
+	case "anthropic":
+		stream, streamErr = h.anthropicProvider.ChatCompletionStream(ctx, req)
+	case "google":
+		stream, streamErr = h.geminiProvider.ChatCompletionStream(ctx, req)
+	default:
+		streaming.SendSSEError(c, fmt.Errorf("streaming not supported for provider %s", providerName))
+		return
+	}
+
+	if streamErr != nil {
+		streaming.SendSSEError(c, streamErr)
+		// Log error in background
+		go h.logRequest(context.Background(), apiKey, providerName, req, nil, false, false, 0, nil, "", customerID, customerLabels)
+		return
+	}
+	defer stream.Close()
+
+	// Step 6: Stream chunks to client and collect for caching
+	collector := streaming.NewStreamCollector(providerName, req.Model)
+	requestID := uuid.New().String()
+
+	// Estimate prompt tokens for cost calculation
+	// We'll update with actual count if provided in the stream
+	promptText := ""
+	for _, msg := range req.Messages {
+		promptText += msg.Content + " "
+	}
+	estimatedPromptTokens := len(promptText) / 4 // Rough estimate: 4 chars per token
+	collector.PromptTokens = estimatedPromptTokens
+
+	fmt.Println("🔄 Streaming started...")
+
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			// Stream completed successfully
+			fmt.Println("✅ Streaming completed")
+
+			// Calculate and send cost info before [DONE]
+			collector.EstimateTokensIfNeeded()
+			fullResponse := collector.ToResponse()
+
+			actualCost, err := h.costCalculator.CalculateCost(providerName, req.Model, fullResponse.Usage.PromptTokens, fullResponse.Usage.CompletionTokens)
+			if err != nil {
+				fmt.Printf("⚠️ Cost calculation failed: %v\n", err)
+				actualCost = estimatedCost
+			}
+
+			// Send cost metadata before [DONE]
+			costData := map[string]interface{}{
+				"object": "chat.completion.chunk.metadata",
+				"usage": map[string]interface{}{
+					"prompt_tokens":     fullResponse.Usage.PromptTokens,
+					"completion_tokens": fullResponse.Usage.CompletionTokens,
+					"total_tokens":      fullResponse.Usage.TotalTokens,
+				},
+				"cost_usd":   actualCost,
+				"latency_ms": int(time.Since(startTime).Milliseconds()),
+				"provider":   providerName,
+			}
+			if err := streaming.SendSSEData(c, costData); err == nil {
+				c.Writer.Flush()
+			}
+
+			streaming.SendSSEDone(c)
+			break
+		}
+
+		if err != nil {
+			// Error during streaming
+			fmt.Printf("❌ Streaming error: %v\n", err)
+			streaming.SendSSEError(c, err)
+			// Log error in background
+			go h.logRequest(context.Background(), apiKey, providerName, req, nil, false, false, 0, nil, requestID, customerID, customerLabels)
+			return
+		}
+
+		// Send chunk to client
+		if err := streaming.SendSSEData(c, chunk); err != nil {
+			// Client disconnected
+			fmt.Printf("⚠️ Client disconnected: %v\n", err)
+			return
+		}
+
+		// Collect chunk for post-processing
+		if len(chunk.Choices) > 0 {
+			delta := chunk.Choices[0].Delta
+			collector.AddChunk(delta.Content)
+
+			// Capture finish reason
+			if chunk.Choices[0].FinishReason != "" {
+				collector.SetFinishReason(string(chunk.Choices[0].FinishReason))
+			}
+		}
+
+		// Capture usage info (sent in last chunk)
+		if chunk.Usage != nil {
+			collector.AddUsage(*chunk.Usage)
+		}
+	}
+
+	// Step 7: Post-stream processing
+
+	go h.postStreamProcessing(context.Background(), apiKey, providerName, req, collector, requestID, estimatedCost, spendKey, startTime, customerID, customerLabels)
+
+	fmt.Printf("✅ Streaming request completed in %dms\n", int(time.Since(startTime).Milliseconds()))
+}
+
+// postStreamProcessing handles caching and logging after stream completes
+func (h *ChatHandler) postStreamProcessing(
+	ctx context.Context,
+	apiKey *models.CachedAPIKey,
+	providerName string,
+	req providers.ChatRequest,
+	collector *streaming.StreamCollector,
+	requestID string,
+	estimatedCost float64,
+	spendKey string,
+	startTime time.Time,
+	customerID string,
+	customerLabels models.Labels,
+) {
+	// Convert collected data to full response
+	fullResponse := collector.ToResponse()
+	fullResponse.ID = requestID
+
+	// Calculate actual cost
+	actualCost, err := h.costCalculator.CalculateCost(
+		providerName,
+		req.Model,
+		collector.PromptTokens,
+		collector.CompletionTokens,
+	)
+	if err != nil {
+		fmt.Printf("⚠️ Cost calculation failed: %v\n", err)
+		actualCost = estimatedCost
+	}
+
+	fullResponse.CostUSD = actualCost
+
+	// Adjust spend (difference between estimated and actual)
+	spendAdjustment := actualCost - estimatedCost
+	if spendAdjustment != 0 {
+		_, _, _, err = h.redis.CheckSpendCap(ctx, spendKey, spendAdjustment, apiKey.MonthlyCap)
+		if err != nil {
+			fmt.Printf("⚠️ Spend adjustment failed: %v\n", err)
+		}
+	}
+
+	// Cache the full response (if caching enabled)
+	if apiKey.CacheEnabled {
+		cacheKey, err := h.exactCache.CacheKey(apiKey.ProjectID, providerName, req.Model, req.Messages)
+		if err == nil {
+			cacheTTL := apiKey.CacheTTL
+			if cacheTTL == 0 {
+				cacheTTL = h.cfg.CacheTTLSeconds
+			}
+			if err := h.exactCache.Set(ctx, apiKey.ProjectID, cacheKey, providerName, req.Model, fullResponse, cacheTTL); err != nil {
+				fmt.Printf("⚠️ Failed to cache: %v\n", err)
+			} else {
+				fmt.Println("💾 Cached streaming response")
+			}
+		}
+
+		// Semantic cache (if enabled)
+		if apiKey.SemanticCacheEnabled && h.semanticCache != nil {
+			if err := h.semanticCache.Set(ctx, apiKey.ProjectID, providerName, req.Model, req.Messages, fullResponse); err != nil {
+				fmt.Printf("⚠️ Failed to cache semantically: %v\n", err)
+			} else {
+				fmt.Println("💾 Cached streaming response (semantic)")
+			}
+		}
+	}
+
+	// Log request
+	h.logRequest(ctx, apiKey, providerName, req, fullResponse, false, false, 0, nil, requestID, customerID, customerLabels)
+
+	fmt.Printf("✅ Post-stream processing complete (cost=$%.6f)\n", actualCost)
+}
