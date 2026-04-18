@@ -30,6 +30,7 @@ type ChatHandler struct {
 	openaiProvider    *providers.OpenAIProvider
 	anthropicProvider *providers.AnthropicProvider
 	geminiProvider    *providers.GeminiProvider
+	ollamaProvider    *providers.OllamaProvider
 	costCalculator    *cost.Calculator
 	exactCache        *cache.ExactCache
 	semanticCache     *cache.SemanticCache
@@ -44,6 +45,7 @@ func NewChatHandler(db *database.DB, redis *redis.Client, cfg *config.Config) *C
 	openaiProvider := providers.NewOpenAIProvider(cfg)
 	anthropicProvider := providers.NewAnthropicProvider(cfg)
 	geminiProvider := providers.NewGeminiProvider(cfg)
+	ollamaProvider := providers.NewOllamaProvider(cfg) // nil when OLLAMA_BASE_URL is not set
 
 	handler := &ChatHandler{
 		db:                db,
@@ -52,6 +54,7 @@ func NewChatHandler(db *database.DB, redis *redis.Client, cfg *config.Config) *C
 		openaiProvider:    openaiProvider,
 		anthropicProvider: anthropicProvider,
 		geminiProvider:    geminiProvider,
+		ollamaProvider:    ollamaProvider,
 		costCalculator:    cost.NewCalculator(db),
 		exactCache:        cache.NewExactCache(redis, db),
 		failoverExecutor:  failover.NewExecutor(),
@@ -59,7 +62,7 @@ func NewChatHandler(db *database.DB, redis *redis.Client, cfg *config.Config) *C
 		customerLimiter:   ratelimit.NewLimiter(redis, db),
 	}
 
-	// Register providers with failover executor
+	// Register cloud providers with failover executor
 	handler.failoverExecutor.RegisterProvider("openai", func() failover.Provider {
 		return openaiProvider
 	})
@@ -69,6 +72,15 @@ func NewChatHandler(db *database.DB, redis *redis.Client, cfg *config.Config) *C
 	handler.failoverExecutor.RegisterProvider("google", func() failover.Provider {
 		return geminiProvider
 	})
+
+	// Register Ollama only when configured
+	if ollamaProvider != nil {
+		handler.failoverExecutor.RegisterProvider("ollama", func() failover.Provider {
+			return ollamaProvider
+		})
+		fmt.Printf("✅ Ollama provider registered (base_url=%s, mode=%s)\n",
+			cfg.OllamaBaseURL, cfg.FailoverMode)
+	}
 
 	// Initialize embedding client and semantic cache if configured
 	if cfg.EmbeddingServiceURL != "" {
@@ -84,7 +96,11 @@ func NewChatHandler(db *database.DB, redis *redis.Client, cfg *config.Config) *C
 		fmt.Println("⚠️  Semantic cache disabled (no EMBEDDING_SERVICE_URL)")
 	}
 
-	fmt.Println("✅ Failover executor initialized with 3 providers")
+	providerCount := 3
+	if ollamaProvider != nil {
+		providerCount = 4
+	}
+	fmt.Printf("✅ Failover executor initialized with %d providers\n", providerCount)
 
 	return handler
 }
@@ -95,24 +111,32 @@ type LLMProvider interface {
 	ValidateModel(model string) bool
 }
 
-// detectProvider detects which provider to use based on model name
+// detectProvider detects which provider to use based on model name and failover mode.
 func (h *ChatHandler) detectProvider(model string) (string, LLMProvider) {
-	// Check OpenAI first (most common)
+	// local_only: skip cloud validation entirely — send everything to Ollama.
+	if h.cfg.FailoverMode == "local_only" {
+		if h.ollamaProvider != nil {
+			return "ollama", h.ollamaProvider
+		}
+		return "", nil
+	}
+
+	// Check cloud providers for known models.
 	if h.openaiProvider.ValidateModel(model) {
 		return "openai", h.openaiProvider
 	}
-
-	// Check Anthropic
 	if h.anthropicProvider.ValidateModel(model) {
 		return "anthropic", h.anthropicProvider
 	}
-
-	// Check Gemini
 	if h.geminiProvider.ValidateModel(model) {
 		return "google", h.geminiProvider
 	}
 
-	// Model not found in any provider
+	// Unknown model: fall through to Ollama (it accepts any pulled model).
+	if h.ollamaProvider != nil {
+		return "ollama", h.ollamaProvider
+	}
+
 	return "", nil
 }
 
@@ -151,10 +175,10 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 
 	fmt.Printf("📡 Routing to %s for model %s\n", providerName, req.Model)
 
-	// Get failover chain for this model (Pro tier feature)
-	// For MVP: All users get failover (we'll add tier checks later)
-	// Note: Failover is disabled for streaming requests (can't retry mid-stream)
-	chain := failover.GetFailoverChain(req.Model)
+	// Get failover chain for this model.
+	// Chain composition respects FAILOVER_MODE (cloud_first / local_first / local_only / cloud_only).
+	// Failover is disabled for streaming requests (can't retry mid-stream).
+	chain := failover.GetFailoverChain(req.Model, h.cfg)
 	if chain != nil && !req.Stream {
 		fmt.Printf("🔄 Failover enabled: %d providers in chain\n", len(chain.Steps))
 	} else if req.Stream {
@@ -316,7 +340,11 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 	estimatedCost, err := h.costCalculator.EstimateCost(providerName, req.Model, estimatedTokens)
 	if err != nil {
 		fmt.Printf("⚠️ Cost estimation failed: %v\n", err)
-		estimatedCost = 0.10 // Fallback estimate
+		if providerName == "ollama" {
+			estimatedCost = 0 // Local models are free
+		} else {
+			estimatedCost = 0.10 // Conservative fallback for unknown cloud models
+		}
 	}
 
 	// Check if we can afford this request

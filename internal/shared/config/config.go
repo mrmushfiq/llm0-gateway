@@ -45,6 +45,19 @@ type Config struct {
 	AnthropicAPIKey string
 	GeminiAPIKey    string
 
+	// Ollama (local models)
+	OllamaBaseURL string // e.g. http://localhost:11434/v1 — leave empty to disable
+
+	// Failover routing strategy
+	// Accepted values: cloud_first (default) | local_first | local_only | cloud_only
+	FailoverMode string
+
+	// Tier-to-local-model mapping used when Ollama is in the chain.
+	// "flagship" = gpt-4o class, "balanced" = gpt-4o-mini class, "budget" = gpt-3.5 class.
+	OllamaModelFlagship string // e.g. llama3.3:70b
+	OllamaModelBalanced string // e.g. qwen2.5:14b
+	OllamaModelBudget   string // e.g. gemma3:4b
+
 	// Cache
 	CacheTTLSeconds int
 	HotKeyCacheTTL  int // Longer TTL for frequently used keys
@@ -92,6 +105,15 @@ func Load() *Config {
 		OpenAIAPIKey:    getEnv("OPENAI_API_KEY", ""),
 		AnthropicAPIKey: getEnv("ANTHROPIC_API_KEY", ""),
 		GeminiAPIKey:    getEnv("GEMINI_API_KEY", ""),
+
+		// Ollama
+		OllamaBaseURL: getEnv("OLLAMA_BASE_URL", ""),
+
+		// Failover routing
+		FailoverMode:        getEnv("FAILOVER_MODE", "cloud_first"),
+		OllamaModelFlagship: getEnv("OLLAMA_MODEL_FLAGSHIP", "llama3.3:70b"),
+		OllamaModelBalanced: getEnv("OLLAMA_MODEL_BALANCED", "qwen2.5:14b"),
+		OllamaModelBudget:   getEnv("OLLAMA_MODEL_BUDGET", "gemma3:4b"),
 
 		// Cache
 		CacheTTLSeconds: getEnvAsInt("CACHE_TTL_SECONDS", 3600),  // 1 hour default

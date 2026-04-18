@@ -214,6 +214,11 @@ func defaultPricing() map[string]ModelPricing {
 
 // CalculateCost calculates the cost for a given model and token usage
 func (c *Calculator) CalculateCost(provider, model string, inputTokens, outputTokens int) (float64, error) {
+	// Ollama runs locally — no API cost.
+	if provider == "ollama" {
+		return 0, nil
+	}
+
 	// Try exact match first: provider:model
 	key := fmt.Sprintf("%s:%s", provider, model)
 	pricing, exists := c.pricing[key]

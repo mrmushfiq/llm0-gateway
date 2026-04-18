@@ -33,3 +33,9 @@ Thumbs.db
 
 # ── Go modules (don't vendor) ─────────────────────────────────────────────────
 vendor/
+
+.cursor/
+
+# ── Private / internal docs ───────────────────────────────────────────────────
+ROADMAP_INTERNAL.md
+*_INTERNAL.md

@@ -91,9 +91,7 @@ func main() {
 	v1.Use(authMiddleware.RequireAPIKey())
 	{
 		v1.POST("/chat/completions", chatHandler.ChatCompletions)
-		// TODO: Add more routes in Phase 2
-		// v1.POST("/embeddings", chatHandler.Embeddings)
-		// v1.GET("/models", chatHandler.ListModels)
+		v1.GET("/models", chatHandler.ListModels)
 	}
 
 	// Create optimized HTTP server
@@ -167,21 +165,26 @@ func printBanner(cfg *config.Config) {
 	fmt.Println("")
 	fmt.Println("╔═══════════════════════════════════════════════════════════╗")
 	fmt.Println("║                                                           ║")
-	fmt.Println("║              🚀 LLM0 Gateway API - Phase 1 🚀             ║")
+	fmt.Println("║               🚀 LLM0 Gateway - Open Source 🚀            ║")
 	fmt.Println("║                                                           ║")
 	fmt.Println("║  OpenAI-compatible LLM proxy with:                        ║")
-	fmt.Println("║  ✓ API Key Authentication (Redis-cached)                 ║")
-	fmt.Println("║  ✓ Rate Limiting (Token Bucket + Lua)                    ║")
-	fmt.Println("║  ✓ Hard Spend Caps (Pre-check)                           ║")
-	fmt.Println("║  ✓ Exact Match Caching (Redis + PostgreSQL)              ║")
-	fmt.Println("║  ✓ Cost Tracking (Per-request)                           ║")
-	fmt.Println("║  ✓ TLS 1.3 with Session Caching                          ║")
+	fmt.Println("║  ✓ Multi-provider Failover (OpenAI / Anthropic / Google) ║")
+	fmt.Println("║  ✓ Ollama Local Models  (FAILOVER_MODE configurable)     ║")
+	fmt.Println("║  ✓ API Key Auth + Rate Limiting (Token Bucket)           ║")
+	fmt.Println("║  ✓ Exact + Semantic Caching (Redis + pgvector)           ║")
+	fmt.Println("║  ✓ Cost Tracking & Spend Caps                            ║")
+	fmt.Println("║  ✓ GET /v1/models  (OpenAI-compatible model list)        ║")
 	fmt.Println("║                                                           ║")
 	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
 	fmt.Println("")
-	fmt.Printf("📍 Listening on: http://localhost:%s\n", cfg.Port)
-	fmt.Printf("📖 Health check: http://localhost:%s/health\n", cfg.Port)
-	fmt.Printf("🔑 API endpoint: http://localhost:%s/v1/chat/completions\n", cfg.Port)
+	fmt.Printf("📍 Listening on:   http://localhost:%s\n", cfg.Port)
+	fmt.Printf("📖 Health check:   http://localhost:%s/health\n", cfg.Port)
+	fmt.Printf("🔑 Chat endpoint:  http://localhost:%s/v1/chat/completions\n", cfg.Port)
+	fmt.Printf("📋 Models list:    http://localhost:%s/v1/models\n", cfg.Port)
+	fmt.Printf("🤖 Failover mode:  %s\n", cfg.FailoverMode)
+	if cfg.OllamaBaseURL != "" {
+		fmt.Printf("🦙 Ollama:         %s\n", cfg.OllamaBaseURL)
+	}
 	fmt.Println("")
 	fmt.Println("Press Ctrl+C to stop...")
 	fmt.Println("")
