@@ -16,6 +16,18 @@ curl http://localhost:8080/v1/chat/completions \
 
 Switch `gpt-4o-mini` for `claude-haiku-4-5-20251001`, `gemini-2.0-flash`, or any local Ollama model (`llama3.3`, `qwen2.5`, `gemma3`, …) — same endpoint, no code changes in your application.
 
+### At a glance
+
+| | |
+|---|---|
+| **Cache-hit p50 / p99** | **11 ms / 16 ms** ([how it's measured](#performance)) |
+| **Rate-limit rejection p50** | **2 ms** — fast-fail protects the gateway from abuse bursts |
+| **Throughput** | **~1,480 req/sec** sustained on a single MacBook Air core |
+| **Binary size / memory** | **30 MB** Go binary, ~50 MB RSS under load |
+| **Dependencies** | Postgres + Redis. That's it. |
+
+> **Faster than LiteLLM, Portkey, and most of the commercial alternatives** — while shipping as a single self-hosted Go binary. See [full benchmark & methodology](#performance).
+
 ---
 
 ## Why LLM0 Gateway?
@@ -852,15 +864,15 @@ llm0-gateway/
 
 ```
                         ┌─────────────────────────────┐
-                        │         LLM0 Gateway         │
-                        │         (Go, :8080)           │
-                        └──────────────┬───────────────┘
+                        │         LLM0 Gateway        │
+                        │         (Go, :8080)         │
+                        └──────────────┬──────────────┘
                                        │
                ┌───────────────────────┼───────────────────────┐
                │                       │                       │
                ▼                       ▼                       ▼
        ┌──────────────┐      ┌──────────────────┐    ┌──────────────────┐
-       │    Redis     │      │    PostgreSQL    │    │ Embedding Service │
+       │    Redis     │      │    PostgreSQL    │    │ Embedding Service│
        │  Rate limits │      │  API keys, logs  │    │ all-MiniLM-L6-v2 │
        │  Exact cache │      │  Exact cache     │    │   (Python)       │
        │  Spend totals│      │  Semantic cache  │    └──────────────────┘
