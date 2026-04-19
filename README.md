@@ -113,36 +113,43 @@ Every request is logged to `gateway_logs` with: provider, model, tokens, cost, l
 
 ## Supported Models
 
+Pricing ships pre-seeded in [`schema/seed_models.sql`](schema/seed_models.sql) and can be extended at runtime via [`scripts/manage_models.sh`](scripts/manage_models.sql) — no code changes or redeploy required. New models from any cloud provider are auto-routable as soon as they're added to the pricing table (see [Dynamic Model Routing](#managing-model-pricing)).
+
 ### OpenAI
-| Model | Tier |
-|---|---|
-| `gpt-4o` | Flagship |
-| `gpt-4o-mini` | Cost-optimized |
-| `gpt-4-turbo` | Flagship |
-| `gpt-3.5-turbo` | Budget |
+| Model | Tier | Context | Input $/1K | Output $/1K |
+|---|---|---:|---:|---:|
+| `gpt-5.4` | Flagship | 1M | $0.0025 | $0.0150 |
+| `gpt-5.4-mini` | Balanced | 1M | $0.00025 | $0.0020 |
+| `gpt-5.4-nano` | Budget | 1M | $0.0001 | $0.0008 |
+| `gpt-4o` | Flagship (prev-gen) | 128K | $0.0025 | $0.0100 |
+| `gpt-4o-mini` | Cost-optimized | 128K | $0.00015 | $0.0006 |
+| `gpt-4-turbo` | Legacy flagship | 128K | $0.0100 | $0.0300 |
+| `gpt-3.5-turbo` | Budget | 16K | $0.0005 | $0.0015 |
 
 ### Anthropic
-| Model | Tier |
-|---|---|
-| `claude-opus-4-6` | Most capable |
-| `claude-sonnet-4-6` | Balanced |
-| `claude-opus-4-5-20251101` | Most capable |
-| `claude-sonnet-4-5-20250929` | Balanced |
-| `claude-haiku-4-5-20251001` | Cost-optimized |
-| `claude-opus-4-20250514` | Most capable |
-| `claude-sonnet-4-20250514` | Balanced |
-| `claude-3-haiku-20240307` | Budget |
+| Model | Tier | Context | Input $/1K | Output $/1K |
+|---|---|---:|---:|---:|
+| `claude-opus-4-7` | Flagship | 200K | $0.0050 | $0.0250 |
+| `claude-opus-4-6` | Most capable | 200K | $0.0150 | $0.0750 |
+| `claude-sonnet-4-6` | Balanced | 200K | $0.0030 | $0.0150 |
+| `claude-opus-4-5-20251101` | Most capable (dated) | 200K | $0.0150 | $0.0750 |
+| `claude-sonnet-4-5-20250929` | Balanced (dated) | 200K | $0.0030 | $0.0150 |
+| `claude-haiku-4-5-20251001` | Cost-optimized | 200K | $0.0008 | $0.0040 |
+| `claude-sonnet-4-20250514` | Balanced (legacy) | 200K | $0.0030 | $0.0150 |
+| `claude-3-haiku-20240307` | Budget | 200K | $0.00025 | $0.00125 |
 
 ### Google Gemini
-| Model | Tier |
-|---|---|
-| `gemini-2.5-pro` | Most capable |
-| `gemini-2.5-flash` | Balanced |
-| `gemini-2.0-flash` | Cost-optimized |
-| `gemini-2.0-flash-lite` | Budget |
+| Model | Tier | Context | Input $/1K | Output $/1K |
+|---|---|---:|---:|---:|
+| `gemini-2.5-pro` | Most capable | 2M | $0.00125 | $0.0100 |
+| `gemini-2.5-flash` | Balanced | 1M | $0.0001 | $0.0004 |
+| `gemini-2.0-flash` | Cost-optimized | 1M | $0.0001 | $0.0004 |
+| `gemini-2.0-flash-lite` | Budget | 1M | $0.000075 | $0.00030 |
+
+> Any new model you add to `model_pricing` is **automatically routable** — the provider is selected by name prefix (`gpt-*` → OpenAI, `claude-*` → Anthropic, `gemini-*` → Google). No code change or redeploy required when a provider ships a new model.
 
 ### Ollama (local)
-Any model pulled on your Ollama instance is automatically routable — `llama3.3:70b`, `qwen2.5:14b`, `gemma3:4b`, `mistral`, `deepseek-r1`, etc. Pull models with `ollama pull <model>` and they appear in `GET /v1/models` instantly.
+Any model pulled on your Ollama instance is automatically routable — `llama3.3:70b`, `qwen2.5:14b`, `gemma3:4b`, `mistral`, `deepseek-r1`, etc. Pull models with `ollama pull <model>` and they appear in `GET /v1/models` instantly. All Ollama requests are metered at **$0 cost**.
 
 The tier env vars (`OLLAMA_MODEL_FLAGSHIP`, `OLLAMA_MODEL_BALANCED`, `OLLAMA_MODEL_BUDGET`) tell the failover engine which local model to substitute when a cloud model is requested. For example, with `OLLAMA_MODEL_BALANCED=qwen2.5:14b` set, a `gpt-4o-mini` request in `local_first` mode tries `qwen2.5:14b` first, then `gpt-4o-mini` on OpenAI if the local call fails.
 
@@ -785,18 +792,6 @@ For cache misses, add the provider round-trip on top (`gpt-4o-mini` ≈ 300–80
 ### A note on Docker Desktop vs production
 
 If you run the gateway inside **Docker Desktop on macOS**, expect p50 ≈ 15ms and p99 ≈ 150ms+ — that's the Docker-for-Mac VM's network overhead, not the gateway. On Linux hosts (EC2, Kubernetes nodes, bare metal) the container networking penalty is ~0.05ms, so production numbers will match the native-Go row above almost exactly.
-
-### What changed in the optimization pass
-
-The gateway went through a deliberate hot-path audit. Notable wins:
-
-- **In-memory cache for `customer_limits`** — avoids a Postgres round trip on every request that carries an `X-LLM0-Customer-ID` header (TTL 60s, invalidates on upsert/delete).
-- **MGET batching** — customer-level spend and request counters fetched in one Redis round trip instead of five separate `GET`s.
-- **Atomic `INCR + EXPIRE` counters** — fixes a read-modify-write race in per-model/per-label tracking that silently undercounted under concurrency.
-- **Async warm-tier cache writes** — Postgres `INSERT` of full response JSON moved off the hot path; Redis is still written synchronously so the next hit is fast.
-- **Async customer-request tracking** — 3+N Redis round trips moved off the hot path; eventual consistency is safe because the pre-request spend cap is still synchronous.
-
-These changes dropped observed p99 from 164ms → 16ms on local Docker testing. Full analysis lives in [`bench/README.md`](bench/README.md).
 
 ### Memory footprint
 
