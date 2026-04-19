@@ -437,26 +437,15 @@ func convertGeminiFinishReason(reason string) openai.FinishReason {
 	}
 }
 
-// ValidateModel checks if a model is supported by Gemini
+// ValidateModel claims Google's model namespace by prefix match.
+//
+// We intentionally skip a hard-coded allowlist: Google ships Gemini variants
+// (2.0 / 2.5 / 3.x / flash / pro / lite / preview / dated pins) frequently,
+// and users register pricing at runtime via scripts/manage_models.sh.
+// A static list would force a rebuild for every new release.
+//
+// If the upstream API doesn't recognize the model, it returns a 404 which
+// the failover executor treats as retriable.
 func (p *GeminiProvider) ValidateModel(model string) bool {
-	validModels := map[string]bool{
-		// Gemini 3 family (preview - latest generation)
-		"gemini-3-pro-preview":   true,
-		"gemini-3-flash-preview": true,
-
-		// Gemini 2.5 family (recommended for production)
-		"gemini-2.5-flash": true,
-		"gemini-2.5-pro":   true,
-
-		// Gemini 2.0 family
-		"gemini-2.0-flash":          true,
-		"gemini-2.0-flash-001":      true, // Stable version
-		"gemini-2.0-flash-exp":      true, // Experimental
-		"gemini-2.0-flash-lite":     true,
-		"gemini-2.0-flash-lite-001": true, // Stable version
-
-		// Note: Gemini 1.5 models removed - they return 404 from API (not available in v1beta)
-		// Use Gemini 2.5 or 2.0 instead
-	}
-	return validModels[model]
+	return strings.HasPrefix(model, "gemini-")
 }

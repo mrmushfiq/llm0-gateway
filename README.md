@@ -307,6 +307,62 @@ go build -o llm0-gateway ./cmd/gateway/main.go
 
 ---
 
+## Managing Model Pricing
+
+### How the default list is seeded
+
+The gateway ships with a curated set of model prices in [`schema/seed_models.sql`](schema/seed_models.sql). It's applied automatically on **first** Postgres boot via the `docker-entrypoint-initdb.d/` mount.
+
+- **Docker Compose users (fresh install)** — no action needed. Works out of the box.
+- **Docker Compose users (existing install)** — Postgres only runs initdb scripts on an empty data volume, so an upgraded `seed_models.sql` won't auto-apply. Re-run it manually against your live DB (safe — idempotent):
+  ```bash
+  docker compose exec -T postgres psql -U llm0 -d llm0_gateway \
+    -f /docker-entrypoint-initdb.d/02_seed_models.sql
+  ```
+- **Non-Docker / manual Postgres** — after applying `schema/schema.sql`, also run:
+  ```bash
+  psql $DATABASE_URL -f schema/seed_models.sql
+  ```
+
+The seed uses `ON CONFLICT (provider, model) DO NOTHING`, so it's safe to re-run and will never overwrite rows you've managed manually.
+
+> **Want stricter schema versioning?** The project ships a single `schema.sql` + `seed_models.sql` pair for simplicity. If your team prefers versioned, reversible migrations, drop in [`golang-migrate`](https://github.com/golang-migrate/migrate) (classic up/down SQL files) or [Atlas](https://atlasgo.io/) (declarative, diff-based) — both integrate cleanly without changing application code.
+
+### Adding / updating / removing entries
+
+Model prices live in the `model_pricing` table. Use the bundled interactive script to add, update, or delete entries when providers release new models or change prices:
+
+```bash
+./scripts/manage_models.sh           # interactive menu
+./scripts/manage_models.sh list      # list all models
+./scripts/manage_models.sh add       # add a new model
+./scripts/manage_models.sh update    # update pricing for an existing model
+./scripts/manage_models.sh delete    # remove a model
+```
+
+After any change, restart the gateway to reload the pricing cache:
+
+```bash
+docker compose restart gateway
+```
+
+Prices are specified per 1,000 tokens in USD (e.g. `gpt-4o-mini` input is `0.00015`). Ollama models can be added with `0.00000000` prices to make their cost explicit in request logs.
+
+### Keeping pricing current
+
+Provider pricing drifts — new models launch, old ones get cheaper, and context windows change. Here's the policy:
+
+| Situation | What to do |
+|---|---|
+| New model released upstream | Add it with `./scripts/manage_models.sh add` — no code change needed. Cloud providers are routed by prefix (`gpt-*`, `claude-*`, `gemini-*`), so new models work immediately. |
+| Want the fix to persist across fresh installs | Submit a PR updating [`schema/seed_models.sql`](schema/seed_models.sql). That single file is the canonical source of truth. |
+| Pricing changed on an existing model | `./scripts/manage_models.sh update` locally; PR the seed file for the upstream fix. |
+| Running a fleet of gateways | Roll out the updated `seed_models.sql` and apply it once per database (`psql ... -f seed_models.sql`). It's idempotent, so re-running is safe. |
+
+We intentionally **do not** auto-scrape provider pricing pages: those pages are unstable, ToS-ambiguous, and silently reformat. Community-reviewed PRs against `seed_models.sql` are the safest long-term update channel — the same approach LiteLLM uses.
+
+---
+
 ## Creating Your First API Key
 
 API keys are in the format `llm0_live_<64 hex chars>`. Only the `bcrypt(SHA-256(key))` hash is stored — the raw key is shown once.
@@ -563,6 +619,74 @@ Spend headers are included in every response:
 - `X-Customer-Spend-Today`
 - `X-Customer-Limit-Daily`
 - `X-Customer-Remaining-Usd`
+
+### How Cost is Calculated
+
+The gateway tracks cost in two places: **before** the call (for spend-cap enforcement) and **after** the call (for actual billing).
+
+**1. Pricing source** — the `model_pricing` table, one row per `(provider, model)` pair with `input_per_1k_tokens` and `output_per_1k_tokens`. Pricing is loaded into memory at startup — restart the gateway after updates via `./scripts/manage_models.sh`.
+
+**2. Cost formula** — applied identically in every path:
+
+```
+cost_usd = (input_tokens  / 1000) × input_per_1k_tokens
+         + (output_tokens / 1000) × output_per_1k_tokens
+```
+
+Both input and output prices are always applied. Ollama (local) requests are always `$0`, regardless of token counts.
+
+**3. Pre-request estimation** — used to block requests that would breach a project or customer spend cap *before* any API call is made:
+
+- **Input tokens** are estimated as `sum(len(role) + len(content) + 4) / 4` across all messages (the industry-standard "~4 chars per token" heuristic).
+- **Output tokens** use the client-supplied `max_tokens` if present. If not, defaults to `2 × input_tokens` clamped to `[100, 2000]` so neither tiny nor huge prompts produce wildly skewed estimates.
+
+This means clients can send `max_tokens: 500` to get a tight, accurate pre-estimate — useful when hovering near a spend cap.
+
+**4. Post-request actual cost** — the gateway reads real `prompt_tokens` and `completion_tokens` from the provider's response and recalculates, then reconciles the difference against Redis spend counters. Every request log in `gateway_logs` has the real cost.
+
+### Cost Tracking Example
+
+```bash
+# Make a request
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer llm0_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "messages": [{"role": "user", "content": "What is F1?"}],
+    "max_tokens": 200
+  }'
+```
+
+The response headers tell you:
+- `X-Cost-USD: 0.000110`
+- `X-Tokens-Prompt: 15`
+- `X-Tokens-Completion: 180`
+
+Aggregate spend by customer, model, or day:
+
+```sql
+-- Top 10 costliest customers this month
+SELECT customer_id, SUM(cost_usd) AS total, COUNT(*) AS requests
+FROM gateway_logs
+WHERE created_at >= date_trunc('month', NOW())
+GROUP BY customer_id
+ORDER BY total DESC
+LIMIT 10;
+
+-- Spend breakdown by model
+SELECT model, SUM(cost_usd) AS total, SUM(tokens_total) AS tokens
+FROM gateway_logs
+WHERE created_at >= NOW() - INTERVAL '7 days'
+GROUP BY model
+ORDER BY total DESC;
+
+-- Average cost per request by customer tier (from labels)
+SELECT labels->>'Tier' AS tier, AVG(cost_usd) AS avg_cost
+FROM gateway_logs
+WHERE labels ? 'Tier'
+GROUP BY tier;
+```
 
 ### Customer Labels
 Attach arbitrary labels to any request for analytics — they're stored as JSONB on `gateway_logs`:

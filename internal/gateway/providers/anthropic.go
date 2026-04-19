@@ -505,27 +505,18 @@ func convertAnthropicFinishReason(stopReason string) string {
 	}
 }
 
-// ValidateModel checks if a model is valid for chat completions
+// ValidateModel claims Anthropic's model namespace by prefix match.
+//
+// We deliberately avoid a hard-coded allowlist here. Anthropic ships new
+// Claude variants regularly (3, 3.5, 4, 4.5, 4.6, 4.7, opus/sonnet/haiku
+// sub-tiers, dated vs alias names, …) and users can register pricing at
+// runtime via scripts/manage_models.sh. Gating on a static list would force
+// a rebuild for every new release.
+//
+// If the upstream API doesn't recognize the model, it returns a 404 which
+// the failover executor treats as retriable.
 func (p *AnthropicProvider) ValidateModel(model string) bool {
-	validModels := map[string]bool{
-		// Claude 4.6 family (Latest)
-		"claude-sonnet-4-6": true, // Sonnet 4.6
-		"claude-opus-4-6":   true, // Opus 4.6
-
-		// Claude 4.5 family
-		"claude-opus-4-5-20251101":   true, // Opus 4.5 (Nov 2025)
-		"claude-haiku-4-5-20251001":  true, // Haiku 4.5 (Oct 2025)
-		"claude-sonnet-4-5-20250929": true, // Sonnet 4.5 (Sep 2025)
-
-		// Claude 4 family
-		"claude-opus-4-1-20250805": true, // Opus 4.1 (Aug 2025)
-		"claude-opus-4-20250514":   true, // Opus 4 (May 2025)
-		"claude-sonnet-4-20250514": true, // Sonnet 4 (May 2025)
-
-		// Claude 3 family
-		"claude-3-haiku-20240307": true, // Haiku 3 (Mar 2024)
-	}
-	return validModels[model]
+	return strings.HasPrefix(model, "claude-")
 }
 
 // GetProviderName returns the provider name

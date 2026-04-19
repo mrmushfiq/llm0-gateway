@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/sashabaranov/go-openai"
 
 	"github.com/mrmushfiq/llm0-gateway/internal/gateway/auth"
 	"github.com/mrmushfiq/llm0-gateway/internal/gateway/cache"
@@ -230,7 +231,8 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 		}
 
 		// Estimate cost for this request (for pre-check)
-		estimatedCost := h.estimateRequestCost(req.Model, req.Messages)
+		// Uses the detected provider so Ollama requests correctly estimate to $0.
+		estimatedCost := h.estimateRequestCost(providerName, req.Model, req.Messages, req.MaxTokens)
 
 		// Check customer limits
 		customerLimitCheck, err = h.customerLimiter.Check(ctx, &ratelimit.CheckRequest{
@@ -335,9 +337,11 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 	// Step 3: Check spend cap BEFORE making API call
 	spendKey := fmt.Sprintf("spend:project:%s:%s", apiKey.ProjectID, time.Now().Format("2006-01"))
 
-	// Estimate cost (conservative)
-	estimatedTokens := 1000 // Conservative estimate
-	estimatedCost, err := h.costCalculator.EstimateCost(providerName, req.Model, estimatedTokens)
+	// Estimate cost based on actual prompt size and client-supplied max_tokens.
+	// This is used to pre-check the project's monthly_cap_usd so huge prompts
+	// can't silently overshoot the cap.
+	promptTokens := estimatePromptTokens(req.Messages)
+	estimatedCost, err := h.costCalculator.EstimateCostForRequest(providerName, req.Model, promptTokens, req.MaxTokens)
 	if err != nil {
 		fmt.Printf("⚠️ Cost estimation failed: %v\n", err)
 		if providerName == "ollama" {
@@ -579,39 +583,50 @@ func (h *ChatHandler) logRequest(
 	}
 }
 
-// estimateRequestCost estimates the cost of a request before making it
-// This is used for pre-checking customer cost limits
-func (h *ChatHandler) estimateRequestCost(model string, messages interface{}) float64 {
-	// Rough token estimation: 4 characters = 1 token
-	// We use interface{} for messages to avoid import cycles
-	// Count characters from all messages (rough approximation)
-	var totalChars int
+// estimatePromptTokens produces a rough prompt-token count from OpenAI-format
+// messages using the industry-standard "4 characters per token" approximation,
+// plus a small per-message overhead for role + message boundary tokens.
+//
+// It's fast (no tokenizer dependencies) and accurate to within ~10% which is
+// plenty for pre-flight cost estimation.
+func estimatePromptTokens(messages []openai.ChatCompletionMessage) int {
+	const (
+		charsPerToken      = 4
+		overheadPerMessage = 4 // role + formatting overhead
+	)
 
-	// Try to extract content from messages (works for most message types)
-	// This is a simple heuristic - for production, you'd want more accurate token counting
-	switch msgs := messages.(type) {
-	case string:
-		totalChars = len(msgs)
-	default:
-		// For complex message types, use a conservative estimate
-		totalChars = 500 // Assume ~125 tokens average
+	totalChars := 0
+	for _, msg := range messages {
+		totalChars += len(msg.Role) + len(msg.Content) + overheadPerMessage
 	}
 
-	estimatedPromptTokens := totalChars / 4
-	if estimatedPromptTokens < 50 {
-		estimatedPromptTokens = 50 // Minimum estimate
+	tokens := totalChars / charsPerToken
+	if tokens < 10 {
+		tokens = 10 // floor so empty-ish prompts don't round to zero
 	}
+	return tokens
+}
 
-	// Assume average completion length (adjust based on your use case)
-	estimatedCompletionTokens := 150
+// estimateRequestCost estimates the USD cost of a request before making it.
+// Used for pre-checking customer daily/monthly spend limits.
+//
+// Delegates token counting to estimatePromptTokens and cost math to the cost
+// package. Returns 0 for Ollama.
+func (h *ChatHandler) estimateRequestCost(
+	provider, model string,
+	messages []openai.ChatCompletionMessage,
+	maxTokens *int,
+) float64 {
+	promptTokens := estimatePromptTokens(messages)
 
-	// Get pricing from database
-	cost, err := h.costCalculator.CalculateCost("", model, estimatedPromptTokens, estimatedCompletionTokens)
+	cost, err := h.costCalculator.EstimateCostForRequest(provider, model, promptTokens, maxTokens)
 	if err != nil {
-		// Fallback to a conservative estimate if pricing not found
-		// Assume GPT-4 pricing as the highest
-		return 0.05 // $0.05 per request as safe upper bound
+		// Model pricing not found — fall back to a conservative upper bound so
+		// customer spend caps still have a sensible ceiling.
+		if provider == "ollama" {
+			return 0
+		}
+		return 0.05
 	}
-
 	return cost
 }

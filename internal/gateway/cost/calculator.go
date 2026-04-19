@@ -285,9 +285,47 @@ func (c *Calculator) ListPricing() map[string]ModelPricing {
 	return c.pricing
 }
 
-// EstimateCost estimates cost before making a request (based on prompt tokens)
-// Assumes average output is 2x input tokens
+// EstimateCost estimates cost before making a request based on an input token count.
+// Assumes output = 2x input when max_tokens is not known.
+// Ollama (local) always returns 0.
 func (c *Calculator) EstimateCost(provider, model string, estimatedInputTokens int) (float64, error) {
-	estimatedOutputTokens := estimatedInputTokens * 2 // Conservative estimate
+	if provider == "ollama" {
+		return 0, nil
+	}
+	estimatedOutputTokens := estimatedInputTokens * 2 // Conservative when no max_tokens hint
 	return c.CalculateCost(provider, model, estimatedInputTokens, estimatedOutputTokens)
+}
+
+// EstimateCostForRequest estimates cost using real prompt size and an optional
+// max_tokens hint from the request body.
+//
+//   - inputTokens:   tokens in the prompt (use EstimatePromptTokens)
+//   - maxTokens:     client-supplied cap from req.MaxTokens (may be nil)
+//
+// Output-token budget selection:
+//   - If maxTokens is provided, it is used as the output budget.
+//   - Otherwise, output is estimated as 2× input, clamped to [100, 2000]
+//     so neither tiny prompts under-estimate nor huge documents massively
+//     over-estimate the post-call cost.
+//
+// Ollama (local) always returns 0.
+func (c *Calculator) EstimateCostForRequest(provider, model string, inputTokens int, maxTokens *int) (float64, error) {
+	if provider == "ollama" {
+		return 0, nil
+	}
+
+	var outputTokens int
+	if maxTokens != nil && *maxTokens > 0 {
+		outputTokens = *maxTokens
+	} else {
+		outputTokens = inputTokens * 2
+		if outputTokens < 100 {
+			outputTokens = 100
+		}
+		if outputTokens > 2000 {
+			outputTokens = 2000
+		}
+	}
+
+	return c.CalculateCost(provider, model, inputTokens, outputTokens)
 }

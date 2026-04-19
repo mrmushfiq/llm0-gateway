@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mrmushfiq/llm0-gateway/internal/shared/config"
@@ -141,15 +142,22 @@ func (p *OpenAIProvider) ChatCompletionStream(ctx context.Context, req ChatReque
 	return stream, nil
 }
 
-// ValidateModel checks if a model is valid for chat completions
+// ValidateModel claims OpenAI's model namespace by prefix match.
+//
+// We intentionally do NOT maintain a hard-coded allowlist here: new models
+// ship frequently (gpt-5, gpt-5.4, o3, o4-mini, chatgpt-*, …) and users can
+// register pricing for them at runtime via scripts/manage_models.sh. Keeping
+// an allowlist here would force a code change + rebuild for every new model.
+//
+// If OpenAI itself doesn't recognize the model we forwarded, it returns a
+// 404, which the failover executor already treats as retriable so the next
+// provider in the chain gets a chance.
 func (p *OpenAIProvider) ValidateModel(model string) bool {
-	validModels := map[string]bool{
-		"gpt-4":             true,
-		"gpt-4-turbo":       true,
-		"gpt-4o":            true,
-		"gpt-4o-mini":       true,
-		"gpt-3.5-turbo":     true,
-		"gpt-3.5-turbo-16k": true,
+	prefixes := []string{"gpt-", "chatgpt-", "o1", "o3", "o4"}
+	for _, pfx := range prefixes {
+		if strings.HasPrefix(model, pfx) {
+			return true
+		}
 	}
-	return validModels[model]
+	return false
 }

@@ -342,26 +342,13 @@ CREATE TABLE IF NOT EXISTS model_pricing (
 
 CREATE INDEX IF NOT EXISTS idx_model_pricing_lookup ON model_pricing(provider, model);
 
--- Seed current pricing (Jan 2026)
-INSERT INTO model_pricing (provider, model, input_per_1k_tokens, output_per_1k_tokens, context_window, supports_streaming, supports_functions) VALUES
--- OpenAI
-('openai', 'gpt-4o',          0.0025,   0.01,    128000,  true, true),
-('openai', 'gpt-4o-mini',     0.00015,  0.0006,  128000,  true, true),
-('openai', 'gpt-4-turbo',     0.01,     0.03,    128000,  true, true),
-('openai', 'gpt-3.5-turbo',   0.0005,   0.0015,  16385,   true, true),
--- Anthropic
-('anthropic', 'claude-opus-4-5-20251101',   0.015,  0.075,  200000, true, false),
-('anthropic', 'claude-sonnet-4-5-20250929', 0.003,  0.015,  200000, true, false),
-('anthropic', 'claude-haiku-4-5-20251001',  0.0008, 0.004,  200000, true, false),
-('anthropic', 'claude-sonnet-4-20250514',   0.003,  0.015,  200000, true, false),
-('anthropic', 'claude-3-5-haiku-20241022',  0.0008, 0.004,  200000, true, false),
-('anthropic', 'claude-3-haiku-20240307',    0.00025,0.00125,200000, true, false),
--- Google
-('google', 'gemini-2.5-pro',       0.00125, 0.01,   2097152, true, false),
-('google', 'gemini-2.5-flash',     0.0001,  0.0004, 1048576, true, false),
-('google', 'gemini-2.0-flash',     0.0001,  0.0004, 1048576, true, false),
-('google', 'gemini-2.0-flash-lite',0.000075,0.0003, 1048576, true, false)
-ON CONFLICT (provider, model) DO NOTHING;
+-- NOTE: Default model pricing is seeded from schema/seed_models.sql.
+-- Docker Compose mounts that file into the postgres initdb directory, so it
+-- runs automatically on first boot. For non-Docker setups, after applying
+-- this file run:  psql $DATABASE_URL -f schema/seed_models.sql
+--
+-- The seed uses ON CONFLICT DO NOTHING, so it's safe to re-run and will
+-- never overwrite user-managed entries (e.g. from scripts/manage_models.sh).
 
 -- ============================================================================
 -- AUTO-UPDATE TRIGGER
