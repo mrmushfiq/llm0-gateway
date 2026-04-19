@@ -497,6 +497,130 @@ func (rc *Client) GetCustomerRequestCount(
 }
 
 // ============================================================================
+// Batched Customer Counter Fetch (MGET — one round trip)
+// ============================================================================
+
+// CustomerCounterSnapshot is a point-in-time view of a customer's spend and
+// request counters across standard time windows.
+type CustomerCounterSnapshot struct {
+	DailySpend     float64
+	MonthlySpend   float64
+	MinuteRequests int
+	HourRequests   int
+	DailyRequests  int
+}
+
+// GetCustomerCounters fetches all five standard rate-limiting counters in a
+// single MGET — one Redis round trip instead of five. This replaces the N
+// separate GET calls previously issued from Limiter.Check and is the single
+// biggest hot-path win for requests that carry an X-LLM0-Customer-ID header.
+//
+// Missing keys are returned as zero values (as expected for absent counters).
+func (rc *Client) GetCustomerCounters(
+	ctx context.Context,
+	projectID, customerID string,
+) (*CustomerCounterSnapshot, error) {
+	now := time.Now()
+	dailySpendKey := fmt.Sprintf("spend:customer:%s:%s:daily:%s",
+		projectID, customerID, now.Format("2006-01-02"))
+	monthlySpendKey := fmt.Sprintf("spend:customer:%s:%s:monthly:%s",
+		projectID, customerID, now.Format("2006-01"))
+	minuteReqKey := fmt.Sprintf("requests:customer:%s:%s:minute:%d",
+		projectID, customerID, now.Unix()/60)
+	hourReqKey := fmt.Sprintf("requests:customer:%s:%s:hour:%d",
+		projectID, customerID, now.Unix()/3600)
+	dailyReqKey := fmt.Sprintf("requests:customer:%s:%s:daily:%s",
+		projectID, customerID, now.Format("2006-01-02"))
+
+	vals, err := rc.client.MGet(ctx,
+		dailySpendKey, monthlySpendKey,
+		minuteReqKey, hourReqKey, dailyReqKey,
+	).Result()
+	if err != nil {
+		return nil, fmt.Errorf("MGET customer counters failed: %w", err)
+	}
+
+	snap := &CustomerCounterSnapshot{}
+	snap.DailySpend = parseAnyFloat(vals[0])
+	snap.MonthlySpend = parseAnyFloat(vals[1])
+	snap.MinuteRequests = parseAnyInt(vals[2])
+	snap.HourRequests = parseAnyInt(vals[3])
+	snap.DailyRequests = parseAnyInt(vals[4])
+	return snap, nil
+}
+
+// MGetInts fetches multiple counter keys with one round trip and returns a
+// slice of ints aligned to the input keys (nil keys → 0).
+// Used for per-model / per-label counter lookups.
+func (rc *Client) MGetInts(ctx context.Context, keys ...string) ([]int, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	vals, err := rc.client.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]int, len(vals))
+	for i, v := range vals {
+		out[i] = parseAnyInt(v)
+	}
+	return out, nil
+}
+
+// IncrWithTTL atomically increments a counter and sets its TTL in one
+// round-trip pipeline. Replaces the racy GET → parse → SET pattern previously
+// used by Limiter.RecordRequest for per-model and per-label counters.
+//
+// Both operations are queued in a transaction pipeline so they ship together.
+// EXPIRE is issued every call (cheap, idempotent); a small Lua "set TTL only
+// on first INCR" would save a few microseconds but adds script-cache overhead.
+func (rc *Client) IncrWithTTL(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	pipe := rc.client.TxPipeline()
+	incrCmd := pipe.Incr(ctx, key)
+	pipe.Expire(ctx, key, ttl)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, fmt.Errorf("INCR+EXPIRE pipeline failed: %w", err)
+	}
+	return incrCmd.Val(), nil
+}
+
+// parseAnyFloat handles nil, string, int64, and float64 results from MGET.
+func parseAnyFloat(v interface{}) float64 {
+	if v == nil {
+		return 0
+	}
+	switch t := v.(type) {
+	case string:
+		var f float64
+		fmt.Sscanf(t, "%f", &f)
+		return f
+	case float64:
+		return t
+	case int64:
+		return float64(t)
+	}
+	return 0
+}
+
+// parseAnyInt handles nil, string, int64 results from MGET.
+func parseAnyInt(v interface{}) int {
+	if v == nil {
+		return 0
+	}
+	switch t := v.(type) {
+	case string:
+		var i int
+		fmt.Sscanf(t, "%d", &i)
+		return i
+	case int64:
+		return int(t)
+	case float64:
+		return int(t)
+	}
+	return 0
+}
+
+// ============================================================================
 // Helper functions
 // ============================================================================
 

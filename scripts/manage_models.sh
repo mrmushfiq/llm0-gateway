@@ -14,7 +14,12 @@
 set -euo pipefail
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-PSQL="docker compose exec -T postgres psql -U llm0 -d llm0_gateway"
+# NOTE: We close stdin (</dev/null) on every psql call so that `docker compose
+# exec -T` does NOT swallow the script's read-prompt input when run interactively
+# or via piped heredocs.
+PSQL_BIN="docker compose exec -T postgres psql -U llm0 -d llm0_gateway"
+psql_run() { $PSQL_BIN "$@" </dev/null; }
+PSQL="psql_run"
 
 color_title()   { printf "\033[1;36m%s\033[0m\n" "$1"; }
 color_success() { printf "\033[1;32m%s\033[0m\n" "$1"; }
@@ -43,18 +48,17 @@ cmd_list() {
   divider
   color_title "  Model Pricing — All Entries"
   divider
-  docker compose exec -T postgres psql -U llm0 -d llm0_gateway \
-    -c "SELECT
-          provider,
-          model,
-          input_per_1k_tokens  AS input_1k,
-          output_per_1k_tokens AS output_1k,
-          context_window       AS ctx,
-          supports_streaming   AS stream,
-          supports_functions   AS fn,
-          updated_at::date     AS updated
-        FROM model_pricing
-        ORDER BY provider, model;"
+  $PSQL -c "SELECT
+              provider,
+              model,
+              input_per_1k_tokens  AS input_1k,
+              output_per_1k_tokens AS output_1k,
+              context_window       AS ctx,
+              supports_streaming   AS stream,
+              supports_functions   AS fn,
+              updated_at::date     AS updated
+            FROM model_pricing
+            ORDER BY provider, model;"
 }
 
 cmd_add() {

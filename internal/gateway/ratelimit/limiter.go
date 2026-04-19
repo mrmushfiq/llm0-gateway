@@ -65,15 +65,23 @@ type CheckResult struct {
 	Headers map[string]string
 }
 
-// Check performs a comprehensive rate limit check for a customer
+// Check performs a comprehensive rate limit check for a customer.
+//
+// Hot-path Redis strategy:
+//   - All standard counters (daily/monthly spend, minute/hour/daily requests)
+//     are fetched in ONE MGET round trip, not 5 serial GETs.
+//   - Per-model and per-label counters (rare) are fetched with a second MGET
+//     only when their limits are configured.
+//
+// This brings a fully-configured Check from ~5–7 Redis round trips down to
+// 1–2 on the fast path.
 func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, error) {
-	// Get customer limit configuration
+	// customer_limits is in-memory cached (see database.customerLimitCache).
 	limit, err := l.db.GetCustomerLimit(ctx, req.ProjectID, req.CustomerID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get customer limit: %w", err)
 	}
 
-	// If no limit configured, allow the request
 	if limit == nil {
 		return &CheckResult{
 			Allowed: true,
@@ -88,33 +96,36 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 		Headers:           make(map[string]string),
 	}
 
-	// 1. Check cost-based limits
+	// ── Single MGET for standard counters (1 round trip) ────────────────────
+	// Always fetch when any cost OR request limit is configured; the extra
+	// keys are free compared to the network cost of a second round trip.
+	var snap *redisClient.CustomerCounterSnapshot
+	if limit.HasCostLimit() || limit.HasRequestLimit() {
+		snap, err = l.redis.GetCustomerCounters(ctx, req.ProjectID.String(), req.CustomerID)
+		if err != nil {
+			return nil, fmt.Errorf("fetch customer counters: %w", err)
+		}
+	}
+
+	// 1. Cost-based limits (no Redis calls — evaluated against snapshot).
 	if limit.HasCostLimit() {
-		blocked, reason, err := l.checkCostLimits(ctx, req, limit, result)
-		if err != nil {
-			return nil, err
-		}
-		if blocked {
+		if blocked, reason := l.evaluateCostLimits(req, limit, snap, result); blocked {
 			result.Allowed = false
 			result.Reason = reason
 			return result, nil
 		}
 	}
 
-	// 2. Check request-based limits
+	// 2. Request-based limits (no Redis calls — evaluated against snapshot).
 	if limit.HasRequestLimit() {
-		blocked, reason, err := l.checkRequestLimits(ctx, req, limit, result)
-		if err != nil {
-			return nil, err
-		}
-		if blocked {
+		if blocked, reason := l.evaluateRequestLimits(limit, snap, result); blocked {
 			result.Allowed = false
 			result.Reason = reason
 			return result, nil
 		}
 	}
 
-	// 3. Check model-specific limits
+	// 3. Model-specific limits (separate MGET — only when configured).
 	if limit.HasModelLimit(req.Model) {
 		blocked, reason, err := l.checkModelLimits(ctx, req, limit, result)
 		if err != nil {
@@ -127,7 +138,7 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 		}
 	}
 
-	// 4. Check label-based limits
+	// 4. Label-based limits (separate MGET — only when labels present).
 	if len(req.Labels) > 0 {
 		blocked, reason, err := l.checkLabelLimits(ctx, req, limit, result)
 		if err != nil {
@@ -140,7 +151,7 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 		}
 	}
 
-	// 5. Check per-request max cost
+	// 5. Per-request max cost (no network).
 	if limit.PerRequestMaxUSD != nil && req.CostUSD > *limit.PerRequestMaxUSD {
 		result.Allowed = false
 		result.Reason = fmt.Sprintf("request cost ($%.4f) exceeds per-request limit ($%.2f)",
@@ -148,149 +159,101 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 		return result, nil
 	}
 
-	// All checks passed
 	return result, nil
 }
 
-// checkCostLimits verifies spend limits
-func (l *Limiter) checkCostLimits(
-	ctx context.Context,
+// evaluateCostLimits applies daily/monthly spend caps using a pre-fetched
+// counter snapshot (no Redis calls).
+func (l *Limiter) evaluateCostLimits(
 	req *CheckRequest,
 	limit *models.CustomerLimit,
+	snap *redisClient.CustomerCounterSnapshot,
 	result *CheckResult,
-) (bool, string, error) {
-	now := time.Now()
-
-	// Get current spend from Redis
-	dailyWindow := fmt.Sprintf("daily:%s", now.Format("2006-01-02"))
-	dailySpend, err := l.redis.GetCustomerSpend(ctx,
-		req.ProjectID.String(), req.CustomerID, dailyWindow)
-	if err != nil {
-		return false, "", fmt.Errorf("failed to get daily spend: %w", err)
+) (blocked bool, reason string) {
+	if snap == nil {
+		return false, ""
 	}
-	result.DailySpend = dailySpend
+	result.DailySpend = snap.DailySpend
+	result.MonthlySpend = snap.MonthlySpend
 
-	monthlyWindow := fmt.Sprintf("monthly:%s", now.Format("2006-01"))
-	monthlySpend, err := l.redis.GetCustomerSpend(ctx,
-		req.ProjectID.String(), req.CustomerID, monthlyWindow)
-	if err != nil {
-		return false, "", fmt.Errorf("failed to get monthly spend: %w", err)
-	}
-	result.MonthlySpend = monthlySpend
-
-	// Check daily limit
 	if limit.DailySpendLimitUSD != nil {
-		projectedDaily := dailySpend + req.CostUSD
-		if projectedDaily > *limit.DailySpendLimitUSD {
-			// Check degradation behavior
+		if snap.DailySpend+req.CostUSD > *limit.DailySpendLimitUSD {
 			if limit.OnLimitBehavior == models.LimitBehaviorDowngrade && limit.DowngradeModel != nil {
 				result.ShouldDegrade = true
 				result.DowngradeModel = limit.DowngradeModel
-				return false, "", nil // Not blocked, but should degrade
+				return false, ""
 			}
-
 			return true, fmt.Sprintf("daily spend limit exceeded (current: $%.4f, limit: $%.2f)",
-				dailySpend, *limit.DailySpendLimitUSD), nil
+				snap.DailySpend, *limit.DailySpendLimitUSD)
 		}
-
-		// Add warning header if approaching limit (80%)
-		if dailySpend >= *limit.DailySpendLimitUSD*0.8 {
-			pct := (dailySpend / *limit.DailySpendLimitUSD) * 100
+		if snap.DailySpend >= *limit.DailySpendLimitUSD*0.8 {
+			pct := (snap.DailySpend / *limit.DailySpendLimitUSD) * 100
 			result.Headers["X-Warning"] = fmt.Sprintf("Customer approaching daily spend limit (%.0f%%)", pct)
 		}
 	}
 
-	// Check monthly limit
 	if limit.MonthlySpendLimitUSD != nil {
-		projectedMonthly := monthlySpend + req.CostUSD
-		if projectedMonthly > *limit.MonthlySpendLimitUSD {
-			// Check degradation behavior
+		if snap.MonthlySpend+req.CostUSD > *limit.MonthlySpendLimitUSD {
 			if limit.OnLimitBehavior == models.LimitBehaviorDowngrade && limit.DowngradeModel != nil {
 				result.ShouldDegrade = true
 				result.DowngradeModel = limit.DowngradeModel
-				return false, "", nil // Not blocked, but should degrade
+				return false, ""
 			}
-
 			return true, fmt.Sprintf("monthly spend limit exceeded (current: $%.4f, limit: $%.2f)",
-				monthlySpend, *limit.MonthlySpendLimitUSD), nil
+				snap.MonthlySpend, *limit.MonthlySpendLimitUSD)
 		}
-
-		// Add warning header if approaching limit (80%)
-		if monthlySpend >= *limit.MonthlySpendLimitUSD*0.8 {
-			pct := (monthlySpend / *limit.MonthlySpendLimitUSD) * 100
+		if snap.MonthlySpend >= *limit.MonthlySpendLimitUSD*0.8 {
+			pct := (snap.MonthlySpend / *limit.MonthlySpendLimitUSD) * 100
 			result.Headers["X-Warning"] = fmt.Sprintf("Customer approaching monthly spend limit (%.0f%%)", pct)
 		}
 	}
 
-	return false, "", nil
+	return false, ""
 }
 
-// checkRequestLimits verifies request count limits
-func (l *Limiter) checkRequestLimits(
-	ctx context.Context,
-	req *CheckRequest,
+// evaluateRequestLimits applies per-minute/hour/day request caps using a
+// pre-fetched counter snapshot (no Redis calls).
+func (l *Limiter) evaluateRequestLimits(
 	limit *models.CustomerLimit,
+	snap *redisClient.CustomerCounterSnapshot,
 	result *CheckResult,
-) (bool, string, error) {
-	now := time.Now()
-	projectID := req.ProjectID.String()
-	customerID := req.CustomerID
+) (blocked bool, reason string) {
+	if snap == nil {
+		return false, ""
+	}
 
-	// Check minute limit
 	if limit.RequestsPerMinute != nil {
-		minuteWindow := fmt.Sprintf("minute:%d", now.Unix()/60)
-		count, err := l.redis.GetCustomerRequestCount(ctx, projectID, customerID, minuteWindow)
-		if err != nil {
-			return false, "", fmt.Errorf("failed to get minute request count: %w", err)
-		}
-		result.MinuteRequests = count
+		result.MinuteRequests = snap.MinuteRequests
 		result.MinuteRequestsLimit = limit.RequestsPerMinute
-
-		if count >= *limit.RequestsPerMinute {
+		if snap.MinuteRequests >= *limit.RequestsPerMinute {
 			return true, fmt.Sprintf("requests per minute limit exceeded (%d/%d)",
-				count, *limit.RequestsPerMinute), nil
+				snap.MinuteRequests, *limit.RequestsPerMinute)
 		}
 	}
 
-	// Check hour limit
 	if limit.RequestsPerHour != nil {
-		hourWindow := fmt.Sprintf("hour:%d", now.Unix()/3600)
-		count, err := l.redis.GetCustomerRequestCount(ctx, projectID, customerID, hourWindow)
-		if err != nil {
-			return false, "", fmt.Errorf("failed to get hour request count: %w", err)
-		}
-		result.HourRequests = count
+		result.HourRequests = snap.HourRequests
 		result.HourRequestsLimit = limit.RequestsPerHour
-
-		if count >= *limit.RequestsPerHour {
+		if snap.HourRequests >= *limit.RequestsPerHour {
 			return true, fmt.Sprintf("requests per hour limit exceeded (%d/%d)",
-				count, *limit.RequestsPerHour), nil
+				snap.HourRequests, *limit.RequestsPerHour)
 		}
 	}
 
-	// Check daily limit
 	if limit.RequestsPerDay != nil {
-		dailyWindow := fmt.Sprintf("daily:%s", now.Format("2006-01-02"))
-		count, err := l.redis.GetCustomerRequestCount(ctx, projectID, customerID, dailyWindow)
-		if err != nil {
-			return false, "", fmt.Errorf("failed to get daily request count: %w", err)
-		}
-		result.DailyRequests = count
+		result.DailyRequests = snap.DailyRequests
 		result.DailyRequestsLimit = limit.RequestsPerDay
-
-		if count >= *limit.RequestsPerDay {
+		if snap.DailyRequests >= *limit.RequestsPerDay {
 			return true, fmt.Sprintf("requests per day limit exceeded (%d/%d)",
-				count, *limit.RequestsPerDay), nil
+				snap.DailyRequests, *limit.RequestsPerDay)
 		}
-
-		// Add warning if approaching limit
-		if count >= int(float64(*limit.RequestsPerDay)*0.8) {
-			pct := (float64(count) / float64(*limit.RequestsPerDay)) * 100
+		if snap.DailyRequests >= int(float64(*limit.RequestsPerDay)*0.8) {
+			pct := (float64(snap.DailyRequests) / float64(*limit.RequestsPerDay)) * 100
 			result.Headers["X-Warning"] = fmt.Sprintf("Customer approaching daily request limit (%.0f%%)", pct)
 		}
 	}
 
-	return false, "", nil
+	return false, ""
 }
 
 // checkModelLimits verifies per-model limits
@@ -369,60 +332,45 @@ func (l *Limiter) checkLabelLimits(
 	return false, "", nil
 }
 
-// RecordRequest records a successful request in all tracking systems
+// RecordRequest records a successful request in all tracking systems.
+//
+// Per-model and per-label counters use atomic INCR+EXPIRE (pipelined) rather
+// than the previous racy GET→parse→SET pattern. Under concurrency the old
+// path silently undercounted; this version is correct and marginally faster.
 func (l *Limiter) RecordRequest(ctx context.Context, req *CheckRequest) error {
 	projectID := req.ProjectID.String()
 	customerID := req.CustomerID
 
-	// 1. Track spend in Redis (daily + monthly)
+	// 1. Track spend in Redis (daily + monthly) — atomic Lua script.
 	_, _, err := l.redis.TrackCustomerSpend(ctx, projectID, customerID, req.CostUSD)
 	if err != nil {
 		return fmt.Errorf("failed to track customer spend: %w", err)
 	}
 
-	// 2. Track request counts in Redis (minute, hour, daily)
+	// 2. Track request counts in Redis (minute, hour, daily) — atomic Lua script.
 	_, _, _, err = l.redis.TrackCustomerRequests(ctx, projectID, customerID, 1)
 	if err != nil {
 		return fmt.Errorf("failed to track customer requests: %w", err)
 	}
 
-	// 3. Track per-model requests
+	// 3. Track per-model requests — atomic INCR + EXPIRE, no race.
 	now := time.Now()
 	modelKey := fmt.Sprintf("requests:customer:%s:%s:model:%s:daily:%s",
 		projectID, customerID, req.Model, now.Format("2006-01-02"))
-	err = l.redis.Set(ctx, modelKey, 1, 0) // Increment by 1
-	if err != nil {
-		// Try to increment
-		val, _ := l.redis.Get(ctx, modelKey)
-		var count int
-		if val != "" {
-			fmt.Sscanf(val, "%d", &count)
-		}
-		count++
-		err = l.redis.Set(ctx, modelKey, fmt.Sprintf("%d", count), 24*time.Hour)
-		if err != nil {
-			return fmt.Errorf("failed to track model requests: %w", err)
-		}
+	if _, err := l.redis.IncrWithTTL(ctx, modelKey, 24*time.Hour); err != nil {
+		return fmt.Errorf("failed to track model requests: %w", err)
 	}
 
-	// 4. Track per-label requests
+	// 4. Track per-label requests — atomic INCR + EXPIRE per label.
 	for _, labelKey := range req.Labels.ToLabelKeys() {
 		labelRedisKey := fmt.Sprintf("requests:customer:%s:%s:label:%s:daily:%s",
 			projectID, customerID, labelKey, now.Format("2006-01-02"))
-
-		val, _ := l.redis.Get(ctx, labelRedisKey)
-		var count int
-		if val != "" {
-			fmt.Sscanf(val, "%d", &count)
-		}
-		count++
-		err = l.redis.Set(ctx, labelRedisKey, fmt.Sprintf("%d", count), 24*time.Hour)
-		if err != nil {
+		if _, err := l.redis.IncrWithTTL(ctx, labelRedisKey, 24*time.Hour); err != nil {
 			return fmt.Errorf("failed to track label requests: %w", err)
 		}
 	}
 
-	// 5. Persist to database in background (async for performance)
+	// 5. Persist to database in background (async for performance).
 	go l.persistToDatabase(context.Background(), req)
 
 	return nil

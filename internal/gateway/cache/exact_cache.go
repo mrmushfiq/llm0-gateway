@@ -82,20 +82,35 @@ func (c *ExactCache) Get(ctx context.Context, cacheKey string) (*providers.ChatR
 	return nil, false, nil
 }
 
-// Set stores a response in the cache
+// Set stores a response in the cache.
+//
+// Hot-path design:
+//   - Redis write is synchronous (sub-ms; needed so a concurrent request
+//     moments later can hit the hot cache).
+//   - Postgres write is dispatched to a goroutine with a fresh context so it
+//     survives request cancellation. The warm (DB) tier is a durability
+//     backstop for Redis eviction/restart; it does NOT need to be visible
+//     before we return the response to the caller.
+//
+// If the gateway crashes before the goroutine completes, we lose at most one
+// cache entry from the DB — the Redis copy persists for its TTL and the next
+// hit will reconstruct the DB row via Set() again.
 func (c *ExactCache) Set(ctx context.Context, projectID uuid.UUID, cacheKey, provider, model string, response *providers.ChatResponse, ttlSeconds int) error {
-	// Store in Redis (hot cache)
 	redisKey := fmt.Sprintf("cache:exact:%s", cacheKey)
 	ttl := time.Duration(ttlSeconds) * time.Second
 	if err := c.storeInRedis(ctx, redisKey, response, ttl); err != nil {
 		fmt.Printf("⚠️ Failed to cache in Redis: %v\n", err)
 	}
 
-	// Store in database (persistent cache)
-	if err := c.storeInDB(ctx, projectID, cacheKey, provider, model, response, ttlSeconds); err != nil {
-		fmt.Printf("⚠️ Failed to cache in DB: %v\n", err)
-		// Don't fail the request if DB caching fails
-	}
+	// Dispatch warm-tier persistence asynchronously so the client response
+	// isn't blocked on a Postgres INSERT of the full response JSON.
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := c.storeInDB(bgCtx, projectID, cacheKey, provider, model, response, ttlSeconds); err != nil {
+			fmt.Printf("⚠️ Failed to cache in DB (async): %v\n", err)
+		}
+	}()
 
 	fmt.Printf("✅ Cached response: %s (ttl=%ds)\n", cacheKey[:16], ttlSeconds)
 	return nil

@@ -62,6 +62,11 @@ type Config struct {
 	CacheTTLSeconds int
 	HotKeyCacheTTL  int // Longer TTL for frequently used keys
 
+	// In-memory cache for customer_limits table. Every request carrying a
+	// customer ID reads this table; caching avoids a Postgres round trip per
+	// request. Stale reads are bounded by this TTL.
+	CustomerLimitCacheTTLSeconds int
+
 	// Embedding Service (Phase 2: Semantic Caching)
 	EmbeddingServiceURL string // URL to embedding service (e.g., http://llm0-embedding-service.internal:8080)
 }
@@ -118,6 +123,9 @@ func Load() *Config {
 		// Cache
 		CacheTTLSeconds: getEnvAsInt("CACHE_TTL_SECONDS", 3600),  // 1 hour default
 		HotKeyCacheTTL:  getEnvAsInt("HOT_KEY_CACHE_TTL", 86400), // 24 hours for hot keys
+
+		// Customer limit cache (hot-path DB read avoidance)
+		CustomerLimitCacheTTLSeconds: getEnvAsInt("CUSTOMER_LIMIT_CACHE_TTL_SECONDS", 60),
 
 		// Embedding Service (Phase 2)
 		EmbeddingServiceURL: getEnv("EMBEDDING_SERVICE_URL", ""), // Empty = semantic cache disabled

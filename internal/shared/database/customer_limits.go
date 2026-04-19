@@ -14,8 +14,20 @@ import (
 // Customer Limits Repository
 // ============================================================================
 
-// GetCustomerLimit retrieves rate limit configuration for a customer
+// GetCustomerLimit retrieves rate limit configuration for a customer.
+//
+// This is called on every request that carries a customer ID. Results are
+// cached in-memory for db.limitCache.ttl (default 60s) to avoid hitting
+// Postgres on the hot path. See customer_limits_cache.go for invalidation
+// semantics.
 func (db *DB) GetCustomerLimit(ctx context.Context, projectID uuid.UUID, customerID string) (*models.CustomerLimit, error) {
+	// Cache hit — may be a positive (limit) or negative (nil) entry.
+	if db.limitCache != nil {
+		if limit, ok := db.limitCache.get(projectID, customerID); ok {
+			return limit, nil
+		}
+	}
+
 	query := `
 		SELECT id, project_id, customer_id,
 		       daily_spend_limit_usd, monthly_spend_limit_usd, per_request_max_usd,
@@ -38,12 +50,19 @@ func (db *DB) GetCustomerLimit(ctx context.Context, projectID uuid.UUID, custome
 	)
 
 	if err == sql.ErrNoRows {
-		return nil, nil // No limit configured
+		// Negative cache so repeat misses don't re-hit Postgres.
+		if db.limitCache != nil {
+			db.limitCache.set(projectID, customerID, nil)
+		}
+		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get customer limit: %w", err)
 	}
 
+	if db.limitCache != nil {
+		db.limitCache.set(projectID, customerID, &limit)
+	}
 	return &limit, nil
 }
 
@@ -74,19 +93,27 @@ func (db *DB) UpsertCustomerLimit(ctx context.Context, limit *models.CustomerLim
 		RETURNING id, created_at, updated_at
 	`
 
-	return db.QueryRowContext(ctx, query,
+	err := db.QueryRowContext(ctx, query,
 		limit.ProjectID, limit.CustomerID,
 		limit.DailySpendLimitUSD, limit.MonthlySpendLimitUSD, limit.PerRequestMaxUSD,
 		limit.RequestsPerMinute, limit.RequestsPerHour, limit.RequestsPerDay,
 		limit.ModelLimits, limit.LabelLimits,
 		limit.OnLimitBehavior, limit.DowngradeModel,
 	).Scan(&limit.ID, &limit.CreatedAt, &limit.UpdatedAt)
+	if err == nil && db.limitCache != nil {
+		// Invalidate so the very next Check() sees the fresh value.
+		db.limitCache.invalidate(limit.ProjectID, limit.CustomerID)
+	}
+	return err
 }
 
 // DeleteCustomerLimit removes a customer limit configuration
 func (db *DB) DeleteCustomerLimit(ctx context.Context, projectID uuid.UUID, customerID string) error {
 	query := `DELETE FROM customer_limits WHERE project_id = $1 AND customer_id = $2`
 	_, err := db.ExecContext(ctx, query, projectID, customerID)
+	if err == nil && db.limitCache != nil {
+		db.limitCache.invalidate(projectID, customerID)
+	}
 	return err
 }
 

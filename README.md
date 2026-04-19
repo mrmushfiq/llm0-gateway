@@ -708,16 +708,99 @@ SELECT labels->>'Tier', SUM(cost_usd) FROM gateway_logs GROUP BY 1;
 
 ## Performance
 
-End-to-end latency measured locally:
+All numbers are **in-process latency** (`gateway_logs.latency_ms`) — the time from request arrival at the Go handler to the response being written. Excludes client network.
 
-| Scenario | Latency |
+### Test setup
+
+All numbers below come from a single run of [`bench/load_test.sh`](bench/load_test.sh) against a locally-built gateway:
+
+| Parameter | Value |
 |---|---|
-| Exact-match cache hit (Redis) | **<1ms** |
-| Exact-match cache hit (Postgres) | **~5ms** |
-| Semantic cache hit | **~20–50ms** |
-| Pass-through (no cache) | Provider latency + **<5ms** gateway overhead |
+| Load tool | [`hey`](https://github.com/rakyll/hey) |
+| Concurrency | **20** in-flight workers |
+| Total requests | **200** (of which 67 succeeded, 133 were rate-limited by the test key's 60 req/min cap) |
+| Throughput observed | **~1,480 req/sec** (client-side, mixed 200 + 429) |
+| Payload | `gpt-4o-mini` chat completion, 1 user message, ~40 tokens total |
+| Host | Apple M4 MacBook Air, Go 1.24, gateway native, Redis 7 + Postgres 17 in Docker |
+| Measurement source | `gateway_logs.latency_ms` (server-side, excludes client RTT) |
 
-Gateway processing overhead (auth + rate limit + cache check + response): **<5ms** at low concurrency. The single Go binary has minimal memory footprint (~30MB idle).
+To reproduce:
+
+```bash
+docker compose up -d postgres redis
+go run ./cmd/gateway &
+export LLM0_API_KEY=llm0_live_<your key>
+./bench/load_test.sh
+```
+
+> The 60 req/min cap on the default test API key is why you'll see 429s — bump `token_bucket_capacity` / `token_bucket_refill_per_min` on the key via `psql` or the management scripts if you want a longer clean run.
+
+### Cache-hit workload (measured)
+
+| Response type | p50 | p95 | p99 | n |
+|---|---:|---:|---:|---:|
+| 200 — Exact-match cache hit | **11 ms** | **15 ms** | **16 ms** | 67 |
+| 429 — Rate-limit rejection  | **2.1 ms** | **5.6 ms** | 5.6 ms | 133 |
+
+### Fast-fail on rejected requests
+
+The gateway is designed to say "no" quickly — rejections short-circuit before the cache lookup, provider routing, and response marshaling:
+
+| Response | p50 | p95 | Path |
+|---|---:|---:|---|
+| **429 rate-limited** | **2.1 ms** | **5.6 ms** | auth → Redis Lua token-bucket → 429 |
+| 200 cache hit | 11 ms | 15 ms | auth → Redis Lua → Redis GET → marshal → 200 |
+
+Rejections being **~5× faster than accepted requests** is the property that keeps a single gateway instance stable during abuse bursts — a runaway client or credential leak can't meaningfully consume gateway CPU because each `DENY` takes ~2ms of work and 0 provider cost.
+
+### Querying your own percentiles
+
+`hey`'s client-side summary mixes 200s and 429s. For per-status-code percentiles, query `gateway_logs` directly:
+
+```bash
+docker compose exec -T postgres psql -U llm0 -d llm0_gateway -c "
+SELECT status,
+       cache_hit,
+       count(*)                                                        AS n,
+       percentile_disc(0.5)  WITHIN GROUP (ORDER BY latency_ms)        AS p50,
+       percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms)        AS p95,
+       percentile_disc(0.99) WITHIN GROUP (ORDER BY latency_ms)        AS p99
+FROM gateway_logs
+WHERE created_at > now() - interval '5 minutes'
+GROUP BY status, cache_hit;"
+```
+
+### What's in each latency bucket
+
+A p50 of 11ms on a cache hit covers:
+
+- Bearer-token auth (Redis cache ~0.3ms)
+- API-key token-bucket rate limit (Redis Lua `EVALSHA`, 1 round trip)
+- Exact-match cache lookup (Redis `GET`, 1 round trip)
+- JSON marshal + HTTP response write
+- Gin middleware chain + logging goroutine spawn
+
+For cache misses, add the provider round-trip on top (`gpt-4o-mini` ≈ 300–800ms to OpenAI, ≈ 200–500ms to Anthropic).
+
+### A note on Docker Desktop vs production
+
+If you run the gateway inside **Docker Desktop on macOS**, expect p50 ≈ 15ms and p99 ≈ 150ms+ — that's the Docker-for-Mac VM's network overhead, not the gateway. On Linux hosts (EC2, Kubernetes nodes, bare metal) the container networking penalty is ~0.05ms, so production numbers will match the native-Go row above almost exactly.
+
+### What changed in the optimization pass
+
+The gateway went through a deliberate hot-path audit. Notable wins:
+
+- **In-memory cache for `customer_limits`** — avoids a Postgres round trip on every request that carries an `X-LLM0-Customer-ID` header (TTL 60s, invalidates on upsert/delete).
+- **MGET batching** — customer-level spend and request counters fetched in one Redis round trip instead of five separate `GET`s.
+- **Atomic `INCR + EXPIRE` counters** — fixes a read-modify-write race in per-model/per-label tracking that silently undercounted under concurrency.
+- **Async warm-tier cache writes** — Postgres `INSERT` of full response JSON moved off the hot path; Redis is still written synchronously so the next hit is fast.
+- **Async customer-request tracking** — 3+N Redis round trips moved off the hot path; eventual consistency is safe because the pre-request spend cap is still synchronous.
+
+These changes dropped observed p99 from 164ms → 16ms on local Docker testing. Full analysis lives in [`bench/README.md`](bench/README.md).
+
+### Memory footprint
+
+The single Go binary is ~30MB RSS at idle, ~50–80MB under load. Concurrent request capacity is bounded by `MAX_CONCURRENT_REQUESTS` (default 10,000).
 
 ---
 

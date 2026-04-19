@@ -13,6 +13,10 @@ import (
 // DB wraps database connection
 type DB struct {
 	*sql.DB
+
+	// In-memory hot caches. Kept on the DB struct because they cache the
+	// results of DB reads and must be invalidated by DB writes.
+	limitCache *customerLimitCache
 }
 
 // NewPostgresDB creates a new PostgreSQL connection
@@ -38,7 +42,15 @@ func NewPostgresDB(cfg *config.Config) (*DB, error) {
 
 	fmt.Printf("✅ PostgreSQL connected (max_conns=100, idle=25)\n")
 
-	return &DB{db}, nil
+	limitTTL := time.Duration(cfg.CustomerLimitCacheTTLSeconds) * time.Second
+	if limitTTL <= 0 {
+		limitTTL = 60 * time.Second
+	}
+
+	return &DB{
+		DB:         db,
+		limitCache: newCustomerLimitCache(limitTTL),
+	}, nil
 }
 
 // HealthCheck checks if database is healthy

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: llm0
+          POSTGRES_PASSWORD: llm0_password
+          POSTGRES_DB: llm0_gateway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U llm0"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Apply database schema
+        env:
+          PGPASSWORD: llm0_password
+        run: |
+          psql -h localhost -U llm0 -d llm0_gateway -f schema/schema.sql
+          psql -h localhost -U llm0 -d llm0_gateway -f schema/seed_models.sql
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        env:
+          DATABASE_URL: postgres://llm0:llm0_password@localhost:5432/llm0_gateway?sslmode=disable
+          REDIS_URL: redis://localhost:6379
+          OPENAI_API_KEY: sk-test-placeholder
+          ANTHROPIC_API_KEY: sk-ant-test-placeholder
+          GEMINI_API_KEY: test-placeholder
+        run: go test -race -count=1 -timeout=60s ./...

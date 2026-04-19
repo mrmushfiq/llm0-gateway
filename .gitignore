@@ -2,6 +2,9 @@
 .env
 .env.local
 .env.production
+.env.back
+.env.dev
+.env.prod
 # Keep the example file
 !.env.example
 

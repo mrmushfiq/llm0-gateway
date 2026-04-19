@@ -442,18 +442,26 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 	// Step 8: Log request in background
 	go h.logRequest(context.Background(), apiKey, finalProvider, req, response, false, false, 0, failoverResult, requestID, customerID, customerLabels)
 
-	// Step 8.5: Record customer request (if customer_id provided)
+	// Step 8.5: Record customer request (if customer_id provided).
+	// Dispatched asynchronously: this performs 3+N Redis round trips plus a
+	// DB write for analytics, none of which need to complete before we
+	// respond to the client. The brief (~ms) window of stale counters is
+	// acceptable — the next request will converge on the correct values.
 	if customerID != "" {
-		err = h.customerLimiter.RecordRequest(ctx, &ratelimit.CheckRequest{
+		recordReq := &ratelimit.CheckRequest{
 			ProjectID:  apiKey.ProjectID,
 			CustomerID: customerID,
 			Model:      failoverResult.FinalModel,
 			CostUSD:    actualCost,
 			Labels:     customerLabels,
-		})
-		if err != nil {
-			fmt.Printf("⚠️ Failed to record customer request: %v\n", err)
 		}
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := h.customerLimiter.RecordRequest(bgCtx, recordReq); err != nil {
+				fmt.Printf("⚠️ Failed to record customer request (async): %v\n", err)
+			}
+		}()
 	}
 
 	// Step 9: Return response with cost
