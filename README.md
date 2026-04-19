@@ -23,8 +23,9 @@ Switch `gpt-4o-mini` for `claude-haiku-4-5-20251001`, `gemini-2.0-flash`, or any
 | **Cache-hit p50 / p99** | **11 ms / 16 ms** ([how it's measured](#performance)) |
 | **Rate-limit rejection p50** | **2 ms** — fast-fail protects the gateway from abuse bursts |
 | **Throughput** | **~1,480 req/sec** sustained on a single MacBook Air core |
+| **Semantic caching** | `pgvector` + `all-MiniLM-L6-v2` — catches paraphrased duplicates at `$0` |
 | **Binary size / memory** | **30 MB** Go binary, ~50 MB RSS under load |
-| **Dependencies** | Postgres + Redis. That's it. |
+| **Dependencies** | Postgres + Redis (+ optional bundled embedding service). That's it. |
 
 > **Faster than LiteLLM, Portkey, and most of the commercial alternatives** — while shipping as a single self-hosted Go binary. See [full benchmark & methodology](#performance).
 
@@ -35,7 +36,7 @@ Switch `gpt-4o-mini` for `claude-haiku-4-5-20251001`, `gemini-2.0-flash`, or any
 - **One endpoint, four backends** — swap between OpenAI, Anthropic, Gemini, and local Ollama models without touching client code.
 - **Local-first or cloud-first, your choice** — a single `FAILOVER_MODE` env var decides whether requests try Ollama first, cloud first, local-only, or cloud-only. Great for privacy-sensitive workloads that need cloud as a backup.
 - **Never get paged for a provider outage** — automatic failover on `429`/`5xx`/`4xx`/timeout/connection errors across providers. Clients never see the failure.
-- **Save real money** — exact-match cache returns `<1ms`, semantic cache catches paraphrased duplicates, and local Ollama calls cost `$0`.
+- **Save real money with two-tier caching** — exact-match cache returns in `<1ms`; an optional **semantic cache** (`pgvector` + `all-MiniLM-L6-v2` embeddings) catches paraphrased duplicates so "What's the capital of France?" and "Tell me France's capital city" share one cached answer. Local Ollama calls cost `$0`.
 - **Built-in SaaS controls** — per-API-key rate limits, per-customer spend caps, hard monthly project caps, customer labels for analytics.
 - **Zero lock-in** — single Go binary, standard Postgres + Redis, open source.
 
@@ -76,11 +77,37 @@ Point the gateway at a running Ollama instance (`OLLAMA_BASE_URL=http://host.doc
 - Cost is always `$0` — skipped in spend checks and logs
 - Tier mapping (`OLLAMA_MODEL_FLAGSHIP`, `_BALANCED`, `_BUDGET`) transparently substitutes local models for cloud equivalents during failover
 
-### Two-Tier Caching
-- **Exact-match**: SHA-256 cache key checked in Redis first (<1ms), then Postgres (~5ms). Identical requests never hit the LLM twice.
-- **Semantic cache**: `pgvector` cosine similarity search detects paraphrased duplicates. Uses `all-MiniLM-L6-v2` (384-dim) embeddings via a bundled Python service.
+### Two-Tier Caching — Exact + Semantic
 
-Both caches are toggleable per API key (`cache_enabled`, `semantic_cache_enabled` columns).
+The gateway ships two independent cache layers that stack together to cut LLM spend dramatically:
+
+**1. Exact-match cache** — SHA-256 over `(project_id, model, provider, messages)`. Checked in Redis (`<1ms`) first, falls through to Postgres (`~5ms`) on restart / Redis eviction. Identical requests **never hit the LLM twice**.
+
+**2. Semantic cache** — for when users ask the same thing differently. The first user message is sent to a bundled embedding service, which returns a 384-dim vector. That vector is compared against cached vectors in Postgres using `pgvector` cosine similarity. If the best match exceeds a configurable threshold (default `0.95`), we return that cached response.
+
+```
+User A: "What's the capital of France?"         → cache miss, calls OpenAI
+User B: "Tell me France's capital city"         → semantic hit (0.97) → $0 instant response
+User C: "france capital?"                       → semantic hit (0.96) → $0 instant response
+```
+
+Both caches are toggleable per-API-key (`cache_enabled`, `semantic_cache_enabled`) and per-project (`semantic_threshold`). When a semantic hit occurs you get:
+
+- `X-Cache-Hit: semantic`
+- `X-Cache-Similarity: 0.973`
+- `similarity_score` column populated in `gateway_logs` for offline analysis
+
+### Embedding Service (bundled)
+
+Semantic caching is powered by a small FastAPI service shipped alongside the gateway in `embedding_service/`:
+
+- **Model**: [`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) — 22M params, 384-dim output, runs on CPU
+- **Runtime**: ~80–150 MB RAM, ~20–40 ms per embedding on a modern CPU
+- **Deployment**: included in `docker-compose.yml` as the `embedding` service; model weights are baked into the image at build time so first-request latency is zero
+- **Optional**: skip the service entirely and semantic caching disables gracefully — exact-match caching still works
+- **Swappable**: implements a simple `POST /embed` contract, so you can point the gateway at any HTTP embedder (BGE, E5, OpenAI `text-embedding-3-small`, self-hosted Instructor) by changing `EMBEDDING_SERVICE_URL`
+
+The architecture is deliberate: keeping embeddings in a separate process means you can scale the embedding service independently, swap in a different model without rebuilding the gateway, or point at a GPU-backed embedder for throughput.
 
 ### Streaming (SSE)
 Full Server-Sent Events support for all providers including Ollama. Responses are normalized to a single OpenAI-compatible format regardless of which provider is used. Each stream ends with a metadata frame containing cost and usage:
@@ -583,14 +610,26 @@ Every response includes diagnostic headers:
 
 ## Rate Limiting & Cost Controls
 
-The gateway has **three independent layers** of usage control, evaluated in order on every request:
+The gateway has **three independent layers** of usage control, evaluated in order on every request.
+
+> **TL;DR — tune everything via an interactive CLI:**
+>
+> ```bash
+> ./scripts/manage_limits.sh
+> ```
+>
+> The script wraps `psql` with a menu-driven UI for updating API-key rate limits, project spend caps, cache/semantic settings, and per-customer limits without writing SQL. Changes take effect without a gateway restart.
 
 ### 1. Per-API-Key Rate Limit (requests/minute)
 A token-bucket algorithm runs atomically in Redis via a Lua script — no race conditions even under thousands of concurrent calls. Each API key has its own `rate_limit_per_minute` stored in the `api_keys` table.
 
-```sql
--- Set a key to 120 requests per minute
-UPDATE api_keys SET rate_limit_per_minute = 120 WHERE key_prefix = 'llm0_live_abc12';
+```bash
+# Interactive (recommended)
+./scripts/manage_limits.sh set-key-rate
+
+# Or direct SQL
+docker compose exec postgres psql -U llm0 -d llm0_gateway -c \
+  "UPDATE api_keys SET rate_limit_per_minute = 120 WHERE key_prefix = 'llm0_live_abc12';"
 ```
 
 The client sees:
@@ -602,13 +641,18 @@ The client sees:
 ### 2. Hard Project Spend Cap (USD/month)
 Each project has a `monthly_cap_usd` column. The gateway **estimates** the request cost before calling the LLM; if it would push the project over the cap, the request is blocked with `402 Payment Required`. This prevents runaway prompts from silently burning dollars.
 
-```sql
--- Set a $50/month cap for a project
-UPDATE projects SET monthly_cap_usd = 50.00 WHERE id = '<project-id>';
+```bash
+./scripts/manage_limits.sh set-project-cap
 ```
 
 ### 3. Per-Customer Spend Limits (daily + monthly USD)
-Set limits per end-user via the `customer_limits` table:
+Set limits per end-user via the `customer_limits` table. The interactive script handles upsert logic, validation, and NULL handling for you:
+
+```bash
+./scripts/manage_limits.sh set-customer-limit
+```
+
+Or directly:
 
 ```sql
 INSERT INTO customer_limits (
