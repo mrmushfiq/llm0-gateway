@@ -1087,7 +1087,7 @@ Areas where contributions are especially useful:
 - Per-model-class routing rules (e.g. "always route coding tasks to X")
 
 See [`CHANGELOG.md`](./CHANGELOG.md) for what shipped in the current release
-and what's planned for the next patch (v0.1.1).
+(v0.1.1) and what's planned for the next patch (v0.1.2).
 
 ---
 
