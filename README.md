@@ -110,12 +110,36 @@ Semantic caching is powered by a small FastAPI service shipped alongside the gat
 The architecture is deliberate: keeping embeddings in a separate process means you can scale the embedding service independently, swap in a different model without rebuilding the gateway, or point at a GPU-backed embedder for throughput.
 
 ### Streaming (SSE)
-Full Server-Sent Events support for all providers including Ollama. Responses are normalized to a single OpenAI-compatible format regardless of which provider is used. Each stream ends with a metadata frame containing cost and usage:
+Full Server-Sent Events support for **all four providers** (OpenAI, Anthropic, Gemini, Ollama). Chunks are normalized to a single OpenAI-compatible `chat.completion.chunk` shape regardless of which provider is upstream, so the same client code works against any backend.
+
+Send `"stream": true` to get a stream instead of a blocking JSON response:
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer llm0_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "messages": [{"role":"user","content":"count to 10 slowly"}],
+    "stream": true
+  }'
+```
+
+The response starts with standard OpenAI chunks, ends with a **metadata frame** carrying cost / usage / latency (so you don't need a second call to know what the request cost), and terminates with `[DONE]`:
 
 ```
-data: {"cost_usd":0.0000021,"latency_ms":1371,"object":"chat.completion.chunk.metadata",...}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"delta":{"content":"Sure"}}],...}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"delta":{"content":"!"}}],...}
+...
+data: {"object":"chat.completion.chunk.metadata","usage":{"prompt_tokens":5,"completion_tokens":38,"total_tokens":43},"cost_usd":0.0000236,"latency_ms":1962,"provider":"openai"}
 data: [DONE]
 ```
+
+**Streaming behavior notes:**
+- **Cache hits return a single JSON body, not a stream.** The response is already complete — there's nothing to stream — so you get the cached payload with `X-Cache-Hit: exact` or `semantic` set. Treat `Content-Type: application/json` in response to a stream request as "this was a cache hit." This matches OpenAI's own caching semantics.
+- **Failover is disabled for streaming requests.** Once a single chunk has been written to the client, we can't retry against a different provider without breaking the stream. Non-streaming requests keep full automatic failover. If provider reliability matters more than streaming UX, set `"stream": false`.
+- **No client-side timeout issues.** The gateway disables the server's 60-second `WriteTimeout` on streaming requests only, so long reasoning outputs (o1, Claude extended thinking) and slow local Ollama generations aren't truncated.
+- **Post-stream caching runs in a background goroutine** after `[DONE]`, so the second identical request returns from cache with the full metadata and no LLM call.
 
 ### Token Bucket Rate Limiting (per API key)
 Each API key has its own `rate_limit_per_minute` enforced atomically in Redis via Lua scripts — no race conditions under high concurrency. Uses a full token bucket algorithm (not a naive counter), so burst traffic within the minute is allowed as long as the per-minute rate isn't breached.
@@ -945,6 +969,9 @@ Areas where contributions are especially useful:
 - Prometheus metrics endpoint (`/metrics`)
 - Additional embedding models for semantic cache
 - Per-model-class routing rules (e.g. "always route coding tasks to X")
+
+See [`CHANGELOG.md`](./CHANGELOG.md) for what shipped in the current release
+and what's planned for the next patch (v0.1.1).
 
 ---
 

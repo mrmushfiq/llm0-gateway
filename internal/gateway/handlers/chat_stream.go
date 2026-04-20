@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,6 +20,16 @@ import (
 // ChatCompletionsStream handles streaming chat completion requests
 func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 	startTime := time.Now()
+
+	// Disable the http.Server WriteTimeout for this request only.
+	// SSE connections can be open for minutes (long reasoning outputs, Ollama
+	// on CPU, agent tool-calling chains); the server-wide 60s WriteTimeout
+	// would otherwise truncate the stream. Other routes keep the standard
+	// timeout. Fails quietly on Go <1.20 or if the writer isn't the stdlib
+	// ResponseWriter — streaming still works, just with the outer timeout.
+	if rc := http.NewResponseController(c.Writer); rc != nil {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
 
 	// Get validated API key from auth middleware
 	apiKey, ok := auth.GetAPIKey(c)
@@ -167,6 +178,12 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 		stream, streamErr = h.anthropicProvider.ChatCompletionStream(ctx, req)
 	case "google":
 		stream, streamErr = h.geminiProvider.ChatCompletionStream(ctx, req)
+	case "ollama":
+		if h.ollamaProvider == nil {
+			streaming.SendSSEError(c, fmt.Errorf("ollama not configured (set OLLAMA_BASE_URL)"))
+			return
+		}
+		stream, streamErr = h.ollamaProvider.ChatCompletionStream(ctx, req)
 	default:
 		streaming.SendSSEError(c, fmt.Errorf("streaming not supported for provider %s", providerName))
 		return
