@@ -27,7 +27,7 @@ Switch `gpt-4o-mini` for `claude-haiku-4-5-20251001`, `gemini-2.0-flash`, or any
 | **Binary size / memory** | **30 MB** Go binary, ~50 MB RSS under load |
 | **Dependencies** | Postgres + Redis (+ optional bundled embedding service). That's it. |
 
-> **Faster than LiteLLM, Portkey, and most of the commercial alternatives** — while shipping as a single self-hosted Go binary. See [full benchmark & methodology](#performance).
+> **Faster than LiteLLM, self-hosted, and MIT-licensed** — a single 30 MB Go binary with reproducible benchmarks you can run in <5 minutes. See [full benchmark & methodology](#performance).
 
 ---
 
