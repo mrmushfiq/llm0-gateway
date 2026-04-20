@@ -514,7 +514,8 @@ All configuration is via environment variables. Copy `.env.example` to `.env`.
 |---|---|---|
 | `PORT` | `8080` | Gateway listen port |
 | `ENVIRONMENT` | `local` | `local` or `production` (switches Gin to release mode) |
-| `CACHE_TTL_SECONDS` | `3600` | Exact-match cache TTL in seconds |
+| `CACHE_TTL_SECONDS` | `3600` | Dual-purpose: (1) default TTL for exact-match cache entries (overridable per project via `projects.cache_ttl_seconds`), and (2) TTL for the Redis `apikey:*` auth cache. Config changes to `monthly_cap_usd`, `rate_limit_per_minute`, or cache flags take up to this long to propagate unless you flush `apikey:*` manually. See `design/enforcement-and-caching.md` |
+| `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` | `60` | TTL for the in-process `customer_limits` cache (per end-user spend/request caps). Changes to the `customer_limits` table propagate within this window, or immediately when updated through the gateway's own data-access layer |
 | `EMBEDDING_SERVICE_URL` | `""` | Enables semantic caching when set. Docker Compose sets this automatically |
 | `REQUEST_TIMEOUT` | `30s` | Upstream request timeout |
 | `MAX_CONCURRENT_REQUESTS` | `10000` | Concurrency ceiling for the HTTP server |
@@ -632,7 +633,12 @@ EMBEDDING_SERVICE_URL=
 docker compose stop embedding
 ```
 
-**2. Per project** — flip the `semantic_cache_enabled` column on the `projects` table. API keys inherit their project's setting, so every key scoped to that project loses semantic cache immediately on the next auth cache refresh (≤ 60 s by default, tunable via `CUSTOMER_LIMIT_CACHE_TTL_SECONDS`).
+**2. Per project** — flip the `semantic_cache_enabled` column on the `projects` table. API keys inherit their project's setting, so every key scoped to that project loses semantic cache on the next auth cache refresh (up to `CACHE_TTL_SECONDS`, default **1 hour**). To force immediate pickup, flush the cached API-key blobs:
+
+```bash
+docker compose exec redis redis-cli --scan --pattern "apikey:*" | \
+  xargs -r docker compose exec -T redis redis-cli DEL
+```
 
 ```bash
 ./scripts/manage_limits.sh           # menu option 6 — "Update project cache settings"

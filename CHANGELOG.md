@@ -111,7 +111,7 @@ full methodology, query, and Linux-vs-macOS comparison.
 
 ---
 
-## [Unreleased] — v0.1.2
+## [Unreleased]
 
 ### Planned
 
@@ -139,6 +139,12 @@ full methodology, query, and Linux-vs-macOS comparison.
   even though the scheduler is healthy. See
   [`design/background-workers.md`](../design/background-workers.md#candidate-fix-for-v012)
   for the proposed `scheduler_heartbeat` design.
+- **`manage_limits.sh` auto-invalidates the API-key auth cache** after
+  UPDATEs to `projects` (cap, rate limit, cache flags). Today an
+  operator has to manually `DEL apikey:*` for changes to propagate
+  faster than `CACHE_TTL_SECONDS` (default 1 hour). See
+  [`design/enforcement-and-caching.md`](../design/enforcement-and-caching.md)
+  → "Propagation delay on config changes".
 
 ### Candidates (not committed)
 
@@ -154,8 +160,67 @@ These are loose ideas — promote to **Planned** when confirmed:
 - Publish pre-built Docker images to GHCR.
 - Document streaming integration recipes (LangChain, LlamaIndex, Vercel
   AI SDK) in `docs/integrations/`.
+- Switch Redis `maxmemory-policy` from `allkeys-lru` to `noeviction` (or
+  a key-prefix-aware alternative) so `spend:*` counters can't be evicted
+  under memory pressure.
 
 ---
 
-[Unreleased]: https://github.com/mrmushfiq/llm0-gateway/compare/v0.1.1...HEAD
+## [0.1.2] — 2026-02-11
+
+Patch release: Redis durability fix + config-propagation doc
+corrections. No schema changes, no env var changes, no API changes.
+
+### Fixed
+
+- **Redis AOF persistence actually enabled in `docker-compose.yml`.**
+  The README and design doc both stated AOF was on; the compose file
+  never set it, and there was no data volume, so a `docker compose
+  down` (or an OOM restart) silently wiped every spend counter. The
+  redis service now runs with `--appendonly yes --appendfsync everysec`
+  and a dedicated `redis_data` named volume. See
+  [`design/enforcement-and-caching.md`](../design/enforcement-and-caching.md)
+  → "What happens on a Redis failure".
+- **Config-propagation docs corrected.** `README.md` and
+  `design/enforcement-and-caching.md` previously stated that
+  per-project settings (`monthly_cap_usd`, `rate_limit_per_minute`,
+  `cache_enabled`, `semantic_cache_enabled`, `semantic_threshold`)
+  propagate within `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` (default 60s).
+  That is wrong — they ride the Redis `apikey:*` auth cache, which
+  uses `CACHE_TTL_SECONDS` (default **3600s / 1 hour**).
+  `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` governs only the in-process
+  `customer_limits` cache.
+
+### Added (docs only)
+
+- New **"How the cap reaches the Lua script"** section in
+  `design/enforcement-and-caching.md` showing the full config path
+  from Postgres → Redis auth cache → Go struct → Lua `ARGV[2]`.
+  Clarifies that the cap value is never stored in its own Redis key.
+- `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` now documented in the env var
+  table in `README.md`.
+- Updated `CACHE_TTL_SECONDS` description to reflect its dual role
+  (exact-match cache TTL **and** API-key auth cache TTL).
+
+### Upgrade notes
+
+```bash
+git pull
+docker compose down
+docker compose up -d
+```
+
+The new `redis_data` volume starts empty. That's no worse than any
+previous Redis restart — counters rebuild naturally from live traffic.
+If you need to reconstruct historical spend, rebuild from
+`gateway_logs` (see
+[`design/enforcement-and-caching.md`](../design/enforcement-and-caching.md)).
+
+Nothing else needs to be rebuilt: the gateway Go binary and the
+embedding image are unchanged.
+
+---
+
+[Unreleased]: https://github.com/mrmushfiq/llm0-gateway/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/mrmushfiq/llm0-gateway/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/mrmushfiq/llm0-gateway/releases/tag/v0.1.1

@@ -23,12 +23,25 @@ services:
       retries: 10
 
   # ── Redis ───────────────────────────────────────────────────────────────────
+  # AOF is enabled because spend counters (spend:project:*, spend:customer:*)
+  # are the source of truth for cap enforcement. A restart without persistence
+  # would reset every project's current-month spend to $0 and let customers
+  # re-burn their cap. `appendfsync everysec` gives at-most-1s data loss on
+  # crash. See design/enforcement-and-caching.md → "What happens on a Redis
+  # failure" for the full rationale and rebuild procedure.
   redis:
     image: redis:7-alpine
     container_name: llm0_redis
     ports:
       - "6379:6379"
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -79,3 +92,4 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
