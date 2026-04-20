@@ -91,14 +91,23 @@ a single `/v1/chat/completions` endpoint.
 
 ### Performance
 
-Measured via `hey` against Docker Compose on macOS (M-series, 8 GB to
-the VM):
+Measured via `hey` against a native-Go gateway with Redis 7 + Postgres 17
+in Docker on an Apple M4 MacBook Air. 200-request run at concurrency 20,
+split into 67 cache-hit 200s and 133 rate-limit 429s (test key capped at
+60 req/min). Numbers are in-process latency from `gateway_logs.latency_ms`,
+excluding client RTT:
 
-- Cache-hit reads: p50 ~0.8 ms, p99 ~6 ms
-- Rate-limit rejections: p50 ~1.5 ms, p99 ~8 ms
-- 500+ RPS sustained on the hot path
+| Response | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| 200 — exact-match cache hit | **11 ms** | 15 ms | 16 ms |
+| 429 — rate-limit rejection  | **2.1 ms** | 5.6 ms | 5.6 ms |
 
-See `README.md` → "Performance" for the full methodology.
+Throughput: ~**1,480 req/sec** sustained (client-side, mixed 200 + 429).
+
+On Linux hosts the container-network penalty is ~0.05 ms rather than
+Docker-for-Mac's ~5 ms, so production numbers on EC2 / bare metal / k8s
+tend to run lower than these. See `README.md` → "Performance" for the
+full methodology, query, and Linux-vs-macOS comparison.
 
 ---
 
