@@ -3,6 +3,7 @@ package workers
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // cleanupOldLogs deletes logs older than retention period
@@ -90,11 +91,8 @@ func (s *Scheduler) resetMonthlySpend(ctx context.Context) error {
 		INSERT INTO system_logs (event_type, message, metadata, created_at)
 		VALUES ($1, $2, $3, NOW())
 	`
-	metadata := fmt.Sprintf(`{
-		"projects_reset": %d,
-		"total_spend_before": %.6f,
-		"reset_date": "%s"
-	}`, projectCount, totalSpendBefore, ctx.Value("now"))
+	metadata := fmt.Sprintf(`{"projects_reset":%d,"total_spend_before":%.6f,"reset_date":"%s"}`,
+		projectCount, totalSpendBefore, time.Now().UTC().Format(time.RFC3339))
 
 	_, _ = s.db.ExecContext(ctx, logQuery,
 		"monthly_spend_reset",

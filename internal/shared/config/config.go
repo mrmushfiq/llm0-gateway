@@ -69,6 +69,13 @@ type Config struct {
 
 	// Embedding Service (Phase 2: Semantic Caching)
 	EmbeddingServiceURL string // URL to embedding service (e.g., http://llm0-embedding-service.internal:8080)
+
+	// Background workers (monthly spend reset, log / cache cleanup,
+	// customer-spend reconciliation). Set to true in multi-replica
+	// deployments where only one replica should run maintenance jobs, or in
+	// tests where you don't want scheduled goroutines running. Defaults to
+	// false — workers run alongside the HTTP server in the same process.
+	DisableBackgroundWorkers bool
 }
 
 func Load() *Config {
@@ -129,6 +136,9 @@ func Load() *Config {
 
 		// Embedding Service (Phase 2)
 		EmbeddingServiceURL: getEnv("EMBEDDING_SERVICE_URL", ""), // Empty = semantic cache disabled
+
+		// Background workers
+		DisableBackgroundWorkers: getEnvAsBool("DISABLE_BACKGROUND_WORKERS", false),
 	}
 }
 

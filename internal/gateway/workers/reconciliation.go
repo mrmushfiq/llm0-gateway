@@ -19,15 +19,17 @@ func (s *Scheduler) reconcileCustomerSpend(ctx context.Context) error {
 
 	fmt.Printf("🔍 Reconciling customer spend for %s\n", dateStr)
 
-	// 1. Get all Redis keys for this date
-	pattern := fmt.Sprintf("customer_spend:*:*:%s", dateStr)
+	// 1. Get all Redis keys for this date.
+	// Keys are written by TrackCustomerSpend in internal/shared/redis/client.go as:
+	//   spend:customer:{project_id}:{customer_id}:daily:{YYYY-MM-DD}
+	pattern := fmt.Sprintf("spend:customer:*:*:daily:%s", dateStr)
 	keys, err := s.redis.Keys(ctx, pattern)
 	if err != nil {
 		return fmt.Errorf("failed to get Redis keys: %w", err)
 	}
 
 	if len(keys) == 0 {
-		fmt.Printf("ℹ️  No customer spend keys found for %s (might be a new deployment)\n", dateStr)
+		fmt.Printf("ℹ️  No customer spend keys found for %s (might be a new deployment or no customer-tagged traffic)\n", dateStr)
 		return nil
 	}
 
@@ -40,20 +42,20 @@ func (s *Scheduler) reconcileCustomerSpend(ctx context.Context) error {
 
 	// 2. For each Redis key, check if PostgreSQL record exists
 	for _, key := range keys {
-		// Parse key: customer_spend:{project_id}:{customer_id}:{date}
+		// Parse key: spend:customer:{project_id}:{customer_id}:daily:{date}
 		parts := strings.Split(key, ":")
-		if len(parts) != 4 {
+		if len(parts) != 6 {
 			fmt.Printf("⚠️  Invalid key format: %s\n", key)
 			continue
 		}
 
-		projectID, err := uuid.Parse(parts[1])
+		projectID, err := uuid.Parse(parts[2])
 		if err != nil {
 			fmt.Printf("⚠️  Invalid project_id in key %s: %v\n", key, err)
 			continue
 		}
 
-		customerID := parts[2]
+		customerID := parts[3]
 		totalChecked++
 
 		// Get Redis value

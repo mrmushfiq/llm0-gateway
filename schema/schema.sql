@@ -351,6 +351,25 @@ CREATE INDEX IF NOT EXISTS idx_model_pricing_lookup ON model_pricing(provider, m
 -- never overwrite user-managed entries (e.g. from scripts/manage_models.sh).
 
 -- ============================================================================
+-- SYSTEM LOGS
+-- Audit trail for scheduled maintenance jobs (monthly spend reset, log
+-- cleanup, cache cleanup, customer-spend reconciliation). Populated by the
+-- Scheduler in internal/gateway/workers. Not on the hot path — written once
+-- per job run, not per request.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS system_logs (
+    id          UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type  VARCHAR(64)   NOT NULL,    -- e.g. 'monthly_spend_reset', 'log_cleanup'
+    message     TEXT          NOT NULL,
+    metadata    JSONB         DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ   DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_logs_event_time ON system_logs(event_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_system_logs_created    ON system_logs(created_at DESC);
+
+-- ============================================================================
 -- AUTO-UPDATE TRIGGER
 -- ============================================================================
 

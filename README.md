@@ -168,9 +168,14 @@ Pre-request cost estimation (for spend cap checks) plus post-request reconciliat
 Every request is logged to `gateway_logs` with: provider, model, tokens, cost, latency, cache status (exact/semantic/miss), similarity score, failover info, customer ID, and arbitrary labels.
 
 ### Background Workers
-- **Cache cleanup** — removes expired exact-match and semantic cache entries
-- **Spend reconciliation** — syncs Redis counters to Postgres periodically
-- **Log maintenance** — manages log retention
+Runs in-process as Go goroutines — no separate cron container.
+- **Monthly spend reset** — zeroes `projects.current_month_spend_usd` at 00:00 UTC on the 1st; catches up on missed resets after downtime
+- **Exact cache cleanup** — hourly prune of expired `exact_cache` rows
+- **Semantic cache cleanup** — daily at 02:00 UTC, prunes `semantic_cache` rows past their per-row TTL
+- **Log maintenance** — weekly `gateway_logs` retention cleanup (Sunday 03:00 UTC)
+- **Spend reconciliation** — hourly drift check between Redis counters and Postgres
+
+Every run writes an audit row to `system_logs` (when it does work). Disable all five with `DISABLE_BACKGROUND_WORKERS=true` for multi-replica deployments — enforcement is Redis-authoritative and unaffected. See [Background Worker Schedule](#background-worker-schedule) for the full cadence table and operational notes, and [How Spend Caps Reset](#how-spend-caps-reset) for how these jobs tie into cap enforcement.
 
 ---
 
@@ -513,6 +518,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env`.
 | `EMBEDDING_SERVICE_URL` | `""` | Enables semantic caching when set. Docker Compose sets this automatically |
 | `REQUEST_TIMEOUT` | `30s` | Upstream request timeout |
 | `MAX_CONCURRENT_REQUESTS` | `10000` | Concurrency ceiling for the HTTP server |
+| `DISABLE_BACKGROUND_WORKERS` | `false` | Skip starting scheduled goroutines (monthly spend reset, cache/log cleanup, reconciliation). Useful in multi-replica deployments where only one replica should run maintenance |
 
 ### TLS (optional)
 
@@ -612,6 +618,42 @@ Cache hits return the stored response without any LLM API call.
 
 **Threshold**: configurable per project (`semantic_threshold` column, default `0.95`). Lower values return more matches but risk returning less relevant cached responses.
 
+### Turning Semantic Cache Off
+
+There are two ways to disable semantic caching, depending on scope:
+
+**1. Globally (all projects)** — unset `EMBEDDING_SERVICE_URL` in your environment. The gateway logs `⚠️ Semantic cache disabled (no EMBEDDING_SERVICE_URL)` at startup and skips the semantic lookup entirely. Exact-match caching is unaffected. The `embedding` service in `docker-compose.yml` can be removed or left idle — it's never called.
+
+```bash
+# In .env
+EMBEDDING_SERVICE_URL=
+
+# Or stop the embedding container alone
+docker compose stop embedding
+```
+
+**2. Per project** — flip the `semantic_cache_enabled` column on the `projects` table. API keys inherit their project's setting, so every key scoped to that project loses semantic cache immediately on the next auth cache refresh (≤ 60 s by default, tunable via `CUSTOMER_LIMIT_CACHE_TTL_SECONDS`).
+
+```bash
+./scripts/manage_limits.sh           # menu option 6 — "Update project cache settings"
+```
+
+Or by SQL:
+
+```sql
+UPDATE projects
+SET semantic_cache_enabled = false
+WHERE id = '<project-uuid>';
+```
+
+Use per-project disable when you have mixed workloads — e.g., chat UIs benefit from semantic hits, but tool-calling agents need exact matches because a single token difference changes intent. The `cache_enabled` column on the same table toggles the exact-match cache independently, so you can keep one and disable the other.
+
+**Note on existing cache rows** — disabling semantic cache only stops *reads and writes*; rows already in the `semantic_cache` table stay put. They'll age out naturally via the daily cleanup job (see below), or you can clear them manually:
+
+```sql
+DELETE FROM semantic_cache WHERE project_id = '<project-uuid>';
+```
+
 ---
 
 ## Response Headers
@@ -706,6 +748,80 @@ Spend headers are included in every response:
 - `X-Customer-Spend-Today`
 - `X-Customer-Limit-Daily`
 - `X-Customer-Remaining-Usd`
+
+### How Spend Caps Reset
+
+All three spend counters (project `monthly_cap_usd`, customer daily, customer monthly) reset automatically — you don't run a cron job.
+
+**1. Redis is the source of truth for enforcement.**
+Every request calls into a Lua script that reads and increments counters stored under date-stamped keys:
+
+| Counter | Redis key | Rotation |
+|---|---|---|
+| Project monthly spend | `spend:project:{project_id}:{YYYY-MM}` | New key on 1st of each month |
+| Customer daily spend | `spend:customer:{project_id}:{customer_id}:daily:{YYYY-MM-DD}` | New key at UTC midnight |
+| Customer monthly spend | `spend:customer:{project_id}:{customer_id}:monthly:{YYYY-MM}` | New key on 1st of each month |
+
+When the date rolls over, the Lua script computes a new key name and starts fresh at `$0.00`. The old keys are still in Redis but no longer read — they're garbage-collected by a `TTL` set on every write (31 days for monthly keys, 24 hours for daily keys). **No manual intervention, no cron job, no downtime window.**
+
+**2. Postgres mirrors for reporting.**
+The `projects.current_month_spend_usd` column and the `customer_spend` rows exist so you can run SQL dashboards. They're maintained by an async write path (off the hot request path) and reset/pruned by a goroutine scheduler:
+
+- `resetMonthlySpend` runs at 00:00 UTC on the 1st of each month, setting `projects.current_month_spend_usd = 0` and advancing `spend_reset_at` to the next month's 1st. If the gateway was down on the 1st, the next startup catches up via `WHERE spend_reset_at <= NOW()`.
+- `cleanupExpiredCache` and `cleanupSemanticCache` prune stale cache rows hourly and daily.
+- `cleanupOldLogs` runs weekly (Sunday 03:00 UTC) to trim `gateway_logs` retention.
+- `reconcileCustomerSpend` runs hourly to detect drift between Redis and Postgres customer-spend totals (for observability only — Redis remains authoritative).
+
+All five workers are started from `cmd/gateway/main.go` on boot and cancelled on `SIGINT`/`SIGTERM`. Set `DISABLE_BACKGROUND_WORKERS=true` in multi-replica deployments where only one replica should run maintenance, or in tests.
+
+**3. Redis persistence matters for production.**
+Because enforcement reads Redis counters directly, Redis restarts without AOF/RDB persistence will reset spend counters mid-month. The bundled `docker-compose.yml` enables `appendonly yes`; verify the same in any managed Redis you use. If you lose Redis data, the `reconcileCustomerSpend` job will flag the drift on its next run — rebuild counters from `SELECT SUM(cost_usd) FROM gateway_logs WHERE project_id = ... AND created_at >= date_trunc('month', NOW())` if needed.
+
+**Manually overriding a reset or unblocking a customer:**
+
+```bash
+# Bump a project's monthly cap (immediately picked up — no gateway restart)
+./scripts/manage_limits.sh set-project-cap
+
+# Raise a specific customer's daily or monthly limit
+./scripts/manage_limits.sh set-customer-limit
+
+# Nuclear option: zero out the Redis counter for a project mid-month
+docker compose exec redis redis-cli DEL "spend:project:<project_id>:$(date -u +%Y-%m)"
+```
+
+### Background Worker Schedule
+
+All scheduled jobs run as in-process Go goroutines — no cron, no sidecar container, no external dependency. On startup the gateway logs each job's next-run time, e.g.:
+
+```
+⏰ [spend-reset] Next run in 258h2m43s
+⏰ [semantic-cache-cleanup] Next run in 20h2m43s
+⏰ [cache-cleanup] Scheduled hourly, first run in 2m43s
+```
+
+| Job | Cadence | Touches | `system_logs.event_type` |
+|---|---|---|---|
+| `cache-cleanup` | Hourly | `DELETE FROM exact_cache WHERE expires_at < NOW()` | `cache_cleanup` (only if >100 rows) |
+| `semantic-cache-cleanup` | Daily at **02:00 UTC** | `DELETE FROM semantic_cache WHERE created_at + (ttl_seconds ‖ 'seconds')::interval < NOW()` | `semantic_cache_cleanup` (only if >100 rows) |
+| `log-cleanup` | Weekly, Sunday at **03:00 UTC** | Trims `gateway_logs` per retention policy | `log_cleanup` |
+| `reconciliation` | Hourly | Read-only drift check: Redis `spend:customer:…` vs `customer_spend` table | `customer_spend_reconciliation` |
+| `spend-reset` | Monthly, day 1 at **00:00 UTC** | Zeroes `projects.current_month_spend_usd`; advances `spend_reset_at` | `monthly_spend_reset` |
+
+**Why these specific cadences:**
+
+- **Exact-match cache is pruned hourly** because it churns fast (`CACHE_TTL_SECONDS` defaults to 1 hour), and row count grows linearly with traffic.
+- **Semantic cache is pruned daily at 02:00 UTC** because rows live longer (per-row `ttl_seconds`, typically hours to days), the `pgvector` HNSW index makes deletes more expensive than a plain b-tree, and scheduling off-peak avoids contention with business-hours traffic.
+- **Log cleanup is weekly** because `gateway_logs` is the most write-heavy table and clients frequently query it for dashboards; running daily would add vacuum pressure.
+- **Reconciliation is hourly** because it's read-only and cheap — it just compares key counts between Redis and Postgres so you catch drift early.
+- **Spend reset is monthly** on the 1st at 00:00 UTC because that's when new date-stamped Redis keys start being used; Postgres just needs to mirror the rollover.
+
+**Operational notes:**
+
+- **Audit trail** — cleanup jobs only write to `system_logs` when they actually delete something substantial (>100 rows), to keep the audit table from filling with no-op entries. `spend-reset` and `reconciliation` always write a row.
+- **Postgres autovacuum** — `DELETE` marks rows dead but doesn't reclaim space until autovacuum runs. If you do heavy semantic-cache churn (millions of rows/day), schedule a weekly `VACUUM (VERBOSE, ANALYZE) semantic_cache;` outside peak hours.
+- **Catch-up on missed runs** — `spend-reset` uses `WHERE spend_reset_at <= NOW()`, so if the gateway was down on the 1st it catches up at next startup. Cache cleanup is self-healing (rows are date-filtered in `expires_at`, so a missed run just means the next one deletes more).
+- **Disable for multi-replica** — set `DISABLE_BACKGROUND_WORKERS=true` on all replicas except one dedicated maintenance replica. Enforcement (rate limits, spend caps) is unaffected because it reads directly from Redis; only the Postgres reporting/cleanup layer goes dormant. Startup log confirms: `⚠️ Background workers disabled via DISABLE_BACKGROUND_WORKERS=true`.
 
 ### How Cost is Calculated
 

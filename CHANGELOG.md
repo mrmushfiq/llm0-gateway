@@ -7,7 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased] — v0.1.1
+## [0.1.1] — 2026-02-11
+
+Maintenance release. Fixes three latent bugs in the background-workers
+subsystem that were masked in v0.1.0 because the scheduler was never actually
+started, plus documents how spend caps reset.
+
+### Fixed
+
+- **Background workers now actually run.** `workers.NewScheduler(...).StartAll(ctx)`
+  was defined but never called from `cmd/gateway/main.go`, so the monthly spend
+  reset, cache cleanup, log retention, and reconciliation jobs were all dormant.
+  Enforcement was unaffected (all spend caps read from Redis, not Postgres), but
+  `projects.current_month_spend_usd` never zeroed, `gateway_logs` grew unbounded,
+  and expired cache rows accumulated. Wired into `main.go` with a cancellable
+  root context that stops workers on `SIGINT` / `SIGTERM`.
+- **`resetMonthlySpend` produced invalid JSON.** The metadata column used
+  `ctx.Value("now")` (always `nil`) producing `"reset_date": "<nil>"`, which
+  Postgres rejected as invalid JSONB. The error was swallowed by a blank
+  identifier on the `ExecContext` call. Now emits RFC3339 timestamps.
+- **`reconcileCustomerSpend` used a stale Redis key pattern.** The job scanned
+  `customer_spend:*:*:{date}` but the actual spend Lua script writes to
+  `spend:customer:{project_id}:{customer_id}:daily:{date}`, so the drift
+  check found zero keys every hour. Fixed pattern and parse offsets.
+
+### Added
+
+- **`system_logs` table** — audit trail written by the scheduler on every job
+  run (monthly spend reset, cache cleanup, log cleanup, reconciliation). Added
+  to `schema/schema.sql` as idempotent `CREATE TABLE IF NOT EXISTS`, so fresh
+  Docker Compose installs pick it up automatically. Existing deployments need
+  the one-line migration in the **Upgrade notes** below.
+- **`DISABLE_BACKGROUND_WORKERS` environment variable** (default `false`) —
+  set to `true` in multi-replica deployments where only one replica should run
+  maintenance jobs, or in tests where you don't want scheduled goroutines.
+
+### Docs
+
+- New **"How Spend Caps Reset"** section in `README.md` documenting:
+  - Redis date-stamped keys and how they rotate without manual intervention
+  - Postgres reporting layer and the five goroutine-based scheduled jobs
+  - Redis persistence caveat (AOF / RDB) and how to rebuild counters from
+    `gateway_logs` if you lose Redis data
+  - Manual override commands (`manage_limits.sh`, direct `redis-cli DEL`)
+- Refreshed the short **Background Workers** blurb in the feature list with
+  explicit names and schedules for each job, plus a pointer to the new section.
+- Added `DISABLE_BACKGROUND_WORKERS` to the environment variables reference.
+
+### Upgrade notes
+
+Existing v0.1.0 deployments need to create the `system_logs` table before
+restarting onto v0.1.1, otherwise the scheduler will log `relation
+"system_logs" does not exist` on every job run (jobs still complete — they
+just can't write their audit row):
+
+```sql
+CREATE TABLE IF NOT EXISTS system_logs (
+    id          UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type  VARCHAR(64)   NOT NULL,
+    message     TEXT          NOT NULL,
+    metadata    JSONB         DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ   DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_logs_event_time ON system_logs(event_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_system_logs_created    ON system_logs(created_at DESC);
+```
+
+Apply it in place:
+
+```bash
+docker compose exec -T postgres psql -U llm0 -d llm0_gateway <<'SQL'
+CREATE TABLE IF NOT EXISTS system_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type VARCHAR(64) NOT NULL,
+    message TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_system_logs_event_time ON system_logs(event_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_system_logs_created ON system_logs(created_at DESC);
+SQL
+```
+
+Fresh `docker compose up` installs pick this up automatically from the
+updated `schema/schema.sql`.
+
+---
+
+## [Unreleased] — v0.1.2
 
 ### Planned
 
@@ -30,7 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Candidates (not committed)
 
-These are loose ideas for v0.1.1 — promote to **Planned** when confirmed:
+These are loose ideas — promote to **Planned** when confirmed:
 
 - Prometheus `/metrics` endpoint (counters for provider/model/status, latency
   histograms, cache hit rate, failover count, cost total).
@@ -81,9 +169,8 @@ First public release.
 - **GitHub Actions CI** — build, vet, test on every push.
 - `GET /v1/models` endpoint returning all configured cloud + local models.
 
-
-
 ---
 
-[Unreleased]: https://github.com/mrmushfiq/llm0-gateway/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mrmushfiq/llm0-gateway/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/mrmushfiq/llm0-gateway/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mrmushfiq/llm0-gateway/releases/tag/v0.1.0

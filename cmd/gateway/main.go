@@ -15,6 +15,7 @@ import (
 
 	"github.com/mrmushfiq/llm0-gateway/internal/gateway/auth"
 	"github.com/mrmushfiq/llm0-gateway/internal/gateway/handlers"
+	"github.com/mrmushfiq/llm0-gateway/internal/gateway/workers"
 	"github.com/mrmushfiq/llm0-gateway/internal/shared/config"
 	"github.com/mrmushfiq/llm0-gateway/internal/shared/database"
 	"github.com/mrmushfiq/llm0-gateway/internal/shared/redis"
@@ -33,8 +34,11 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	// Initialize components
-	ctx := context.Background()
+	// Root context for background workers — cancelled on SIGINT/SIGTERM so
+	// scheduled goroutines (monthly spend reset, log cleanup, etc.) exit
+	// alongside the HTTP server.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Connect to database
 	db, err := database.NewPostgresDB(cfg)
@@ -49,6 +53,17 @@ func main() {
 		log.Fatalf("❌ Failed to connect to Redis: %v", err)
 	}
 	defer redisClient.Close()
+
+	// Start scheduled maintenance workers (monthly spend reset, log / cache
+	// cleanup, customer-spend reconciliation). Each job runs as its own
+	// goroutine and exits when ctx is cancelled. Enforcement is always
+	// Redis-backed and unaffected if this is disabled — these jobs only
+	// maintain the Postgres reporting layer and prune stale rows.
+	if !cfg.DisableBackgroundWorkers {
+		workers.NewScheduler(db, redisClient).StartAll(ctx)
+	} else {
+		log.Printf("⚠️  Background workers disabled via DISABLE_BACKGROUND_WORKERS=true")
+	}
 
 	// Initialize auth validator
 	validator := auth.NewValidator(db, redisClient, cfg)
@@ -125,9 +140,13 @@ func main() {
 	<-quit
 	log.Println("🛑 Shutting down server...")
 
+	// Cancel root context first so background workers stop picking up new
+	// work while the HTTP server drains in-flight requests.
+	cancel()
+
 	// Graceful shutdown with timeout
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("⚠️  Server forced to shutdown: %v", err)
