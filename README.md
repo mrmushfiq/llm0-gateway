@@ -22,7 +22,7 @@ Switch `gpt-4o-mini` for `claude-haiku-4-5-20251001`, `gemini-2.0-flash`, or any
 |---|---|
 | **Cache-hit p50 / p99** | **11 ms / 16 ms** ([how it's measured](#performance)) |
 | **Rate-limit rejection p50** | **2 ms** — fast-fail protects the gateway from abuse bursts |
-| **Throughput** | **~1,480 req/sec** sustained on a single MacBook Air core |
+| **Throughput** | **~1,480 req/sec** sustained on a single MacBook Air |
 | **Semantic caching** | `pgvector` + `all-MiniLM-L6-v2` — catches paraphrased duplicates at `$0` |
 | **Binary size / memory** | **30 MB** Go binary, ~50 MB RSS under load |
 | **Dependencies** | Postgres + Redis (+ optional bundled embedding service). That's it. |
