@@ -109,10 +109,10 @@ Our published numbers (see main README Performance section):
 | DO 2 vCPU Linux droplet | 7 ms |
 | MacBook Air M4, native Go + Docker Desktop | 11 ms |
 
-The laptop is slower than the $48/mo Linux droplet because Docker
-Desktop on macOS routes container traffic through a VM network bridge
-(~1–2 ms per Redis round trip). **Benchmark on Linux for representative
-production numbers.**
+The laptop is slower than the DO 4 vCPU shared Linux droplet because
+Docker Desktop on macOS routes container traffic through a VM network
+bridge (~1–2 ms per Redis round trip). **Benchmark on Linux for
+representative production numbers.**
 
 ## What to include in a PR
 

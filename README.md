@@ -20,9 +20,9 @@ Switch `gpt-4o-mini` for `claude-haiku-4-5-20251001`, `gemini-2.0-flash`, or any
 
 | | |
 |---|---|
-| **Cache-hit p50 / p99** | **3 ms / 23 ms** on a $48/mo DigitalOcean droplet ([how it's measured](#performance)) |
+| **Cache-hit p50 / p99** | **3 ms / 23 ms** on a DigitalOcean 4 vCPU shared Linux droplet ([how it's measured](#performance)) |
 | **Rate-limit rejection p50** | **2 ms** — fast-fail protects the gateway from abuse bursts |
-| **Throughput** | **~1,672 req/sec** sustained on a 4 vCPU Linux droplet |
+| **Throughput** | **~1,672 req/sec** sustained on a DigitalOcean 4 vCPU shared Linux droplet |
 | **Semantic caching** | `pgvector` + `all-MiniLM-L6-v2` — catches paraphrased duplicates at `$0` |
 | **Binary size / memory** | **30 MB** Go binary, ~50 MB RSS under load |
 | **Dependencies** | Postgres + Redis (+ optional bundled embedding service). That's it. |
@@ -1038,7 +1038,7 @@ For cache misses, add the provider round-trip on top (`gpt-4o-mini` ≈ 300–80
 
 ### A note on Docker Desktop vs production Linux
 
-The laptop row in the table above (11 ms p50) is slower than the **$48/mo DigitalOcean droplet** (3 ms p50) — not because the droplet has a better CPU, but because **Docker Desktop on macOS routes container traffic through a virtual network bridge into a Linux VM**. Every Redis round trip pays a ~1–2 ms tax on macOS that doesn't exist on native Linux.
+The laptop row in the table above (11 ms p50) is slower than the **DigitalOcean 4 vCPU shared Linux droplet** (3 ms p50) — not because the droplet has a better CPU, but because **Docker Desktop on macOS routes container traffic through a virtual network bridge into a Linux VM**. Every Redis round trip pays a ~1–2 ms tax on macOS that doesn't exist on native Linux.
 
 Takeaway: **production numbers match the DigitalOcean rows, not the laptop row**. If you're benchmarking the gateway on a Mac and seeing single-digit millisecond p50, that's actually *slower* than what you'll see on a Linux VPS at the same CPU count. Run the benchmark on a real Linux host (EC2, Hetzner, DigitalOcean, Linode, bare metal) for representative numbers before making production decisions.
 
