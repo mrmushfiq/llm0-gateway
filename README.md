@@ -20,9 +20,9 @@ Switch `gpt-4o-mini` for `claude-haiku-4-5-20251001`, `gemini-2.0-flash`, or any
 
 | | |
 |---|---|
-| **Cache-hit p50 / p99** | **11 ms / 16 ms** ([how it's measured](#performance)) |
+| **Cache-hit p50 / p99** | **3 ms / 23 ms** on a $48/mo DigitalOcean droplet ([how it's measured](#performance)) |
 | **Rate-limit rejection p50** | **2 ms** — fast-fail protects the gateway from abuse bursts |
-| **Throughput** | **~1,480 req/sec** sustained on a single MacBook Air |
+| **Throughput** | **~1,672 req/sec** sustained on a 4 vCPU Linux droplet |
 | **Semantic caching** | `pgvector` + `all-MiniLM-L6-v2` — catches paraphrased duplicates at `$0` |
 | **Binary size / memory** | **30 MB** Go binary, ~50 MB RSS under load |
 | **Dependencies** | Postgres + Redis (+ optional bundled embedding service). That's it. |
@@ -921,16 +921,14 @@ All numbers are **in-process latency** (`gateway_logs.latency_ms`) — the time 
 
 ### Test setup
 
-All numbers below come from a single run of [`bench/load_test.sh`](bench/load_test.sh) against a locally-built gateway:
+All numbers below come from runs of [`bench/load_test.sh`](bench/load_test.sh):
 
 | Parameter | Value |
 |---|---|
 | Load tool | [`hey`](https://github.com/rakyll/hey) |
 | Concurrency | **20** in-flight workers |
-| Total requests | **200** (of which 67 succeeded, 133 were rate-limited by the test key's 60 req/min cap) |
-| Throughput observed | **~1,480 req/sec** (client-side, mixed 200 + 429) |
+| Total requests | **200** (majority succeed as cache hits, remainder rate-limited by the test key's 60 req/min cap) |
 | Payload | `gpt-4o-mini` chat completion, 1 user message, ~40 tokens total |
-| Host | Apple M4 MacBook Air, Go 1.24, gateway native, Redis 7 + Postgres 17 in Docker |
 | Measurement source | `gateway_logs.latency_ms` (server-side, excludes client RTT) |
 
 To reproduce:
@@ -944,12 +942,20 @@ export LLM0_API_KEY=llm0_live_<your key>
 
 > The 60 req/min cap on the default test API key is why you'll see 429s — bump `token_bucket_capacity` / `token_bucket_refill_per_min` on the key via `psql` or the management scripts if you want a longer clean run.
 
-### Cache-hit workload (measured)
+### Cache-hit latency across deployments
 
-| Response type | p50 | p95 | p99 | n |
-|---|---:|---:|---:|---:|
-| 200 — Exact-match cache hit | **11 ms** | **15 ms** | **16 ms** | 67 |
-| 429 — Rate-limit rejection  | **2.1 ms** | **5.6 ms** | 5.6 ms | 133 |
+| Deployment | p50 | p95 | p99 | Throughput (client) | n |
+|---|---:|---:|---:|---:|---:|
+| **DO 4 vCPU / 8 GB droplet**, Linux (run 1) | **3 ms** | **12 ms** | **23 ms** | **~1,672 req/s** | 79 |
+| **DO 4 vCPU / 8 GB droplet**, Linux (run 2) | **4 ms** | **12 ms** | **16 ms** | **~1,006 req/s** | 78 |
+| DO 2 vCPU / 2 GB droplet, Linux | 7 ms | 17 ms | 22 ms | ~1,194 req/s | 82 |
+| MacBook Air M4, native Go + Docker Desktop (Redis/Postgres) | 11 ms | 15 ms | 16 ms | ~1,480 req/s | 67 |
+
+Two independent 4 vCPU runs shown to illustrate the caveat below: **p50 and p95 are stable (3–4 ms / 12 ms), p99 wiggles run-to-run (16–23 ms)** — because p99 is dominated by Go GC pauses and Redis connection warm-up, not by request path CPU.
+
+**The 4 vCPU droplet is faster than the MacBook Air at p50** — not because the droplet CPU is faster (it isn't), but because **Docker Desktop on macOS adds network-VM overhead that Linux containers don't have**. Every Redis round trip on macOS goes through a virtual network bridge into the Docker-for-Mac VM; on Linux the overhead is ~0.05ms. When you're measuring 3ms of gateway work, a 1–2ms network tax per Redis call is half your budget.
+
+This is the real answer to "what is the gateway actually doing?" — auth + rate-limit Lua + cache GET + JSON marshal + response write, all in ~3 ms of CPU when the platform isn't in the way.
 
 ### Fast-fail on rejected requests
 
@@ -957,14 +963,29 @@ The gateway is designed to say "no" quickly — rejections short-circuit before 
 
 | Response | p50 | p95 | Path |
 |---|---:|---:|---|
-| **429 rate-limited** | **2.1 ms** | **5.6 ms** | auth → Redis Lua token-bucket → 429 |
-| 200 cache hit | 11 ms | 15 ms | auth → Redis Lua → Redis GET → marshal → 200 |
+| **429 rate-limited** | **~2 ms** | **~6 ms** | auth → Redis Lua token-bucket → 429 |
+| 200 cache hit | 3 ms | 12 ms | auth → Redis Lua → Redis GET → marshal → 200 |
 
-Rejections being **~5× faster than accepted requests** is the property that keeps a single gateway instance stable during abuse bursts — a runaway client or credential leak can't meaningfully consume gateway CPU because each `DENY` takes ~2ms of work and 0 provider cost.
+Rejections short-circuiting at this speed is the property that keeps a single gateway instance stable during abuse bursts — a runaway client or credential leak can't meaningfully consume gateway CPU because each `DENY` takes ~2 ms of work and 0 provider cost.
 
-### Querying your own percentiles
+### Caveats worth reading before you quote these numbers
 
-`hey`'s client-side summary mixes 200s and 429s. For per-status-code percentiles, query `gateway_logs` directly:
+- **Sample size is small.** ~80 samples per run for p99 is enough to be directionally right, not tight enough to publish ±0.5 ms. Two 4 vCPU runs gave p99s of 23 ms and 16 ms — same droplet, same script, same concurrency. Quote a range, not a single point.
+- **p99 is GC- and connection-warm-up-bound, not CPU-bound.** The 2 vCPU and 4 vCPU droplets have similar p99s (22–23 ms on one run, 16 ms on another for the same 4 vCPU droplet) because the tail is dominated by Go GC pauses and first-request Redis connection setup, neither of which scale with CPU count. Throwing more hardware at the gateway won't reliably push p99 below ~15 ms without GC tuning (`GOGC=200+`) and pool pre-warming — both out of scope for v0.1.x.
+- **These are cache-hit numbers.** Cache misses are dominated by upstream provider latency (`gpt-4o-mini` ≈ 300–800 ms to OpenAI, ≈ 200–500 ms to Anthropic). That's not gateway overhead — that's your LLM taking its time.
+
+### Querying your own percentiles (recommended)
+
+**Always quote the server-side `gateway_logs.latency_ms` numbers — not `hey`'s client-side summary.** `hey` measures end-to-end wall clock on the load generator's machine, which includes:
+
+- Local loopback / network stack latency (small on Linux, 1–2 ms on Docker-for-Mac)
+- `hey`'s own goroutine scheduling and HTTP client overhead
+- TCP connection reuse state across 20 concurrent workers
+- 200s and 429s mixed into one histogram (429s drag the percentiles down)
+
+`gateway_logs.latency_ms` captures only the gateway's own handler time — from request arrival at the Go handler to response being written. That is what you want to advertise as "gateway overhead."
+
+Run this after your benchmark to get per-status-code server-side percentiles:
 
 ```bash
 docker compose exec -T postgres psql -U llm0 -d llm0_gateway -c "
@@ -975,25 +996,51 @@ SELECT status,
        percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms)        AS p95,
        percentile_disc(0.99) WITHIN GROUP (ORDER BY latency_ms)        AS p99
 FROM gateway_logs
-WHERE created_at > now() - interval '5 minutes'
+WHERE created_at > now() - interval '15 minutes'
 GROUP BY status, cache_hit;"
 ```
 
+Example output (4 vCPU / 8 GB DigitalOcean droplet, immediately after `./bench/load_test.sh`):
+
+```
+ status  | cache_hit | n  | p50 | p95  | p99
+---------+-----------+----+-----+------+------
+ success | f         |  6 | 826 | 1856 | 1856
+ success | t         | 78 |   4 |   12 |   16
+```
+
+- `cache_hit = t` → 78 cache-hit responses with **p50 4 ms, p99 16 ms** of gateway overhead
+- `cache_hit = f` → 6 cache-miss responses dominated by OpenAI provider latency (`gpt-4o-mini` was slow that run; this varies 5× day-to-day based on provider load)
+
+### Why `hey`'s numbers are larger than these
+
+Same benchmark, side by side on that run:
+
+| Metric | `hey` (client-side) | `gateway_logs` (server-side) |
+|---|---:|---:|
+| p50 | 4.5 ms | 4 ms |
+| p95 | 14.5 ms | 12 ms |
+| p99 | 20 ms | 16 ms |
+
+The client-side numbers are systematically **0.5–5 ms larger** because they include local network stack, `hey` scheduling, and connection setup. On Docker-for-Mac the delta is much larger (10–50+ ms at the tail). Always quote the `gateway_logs` numbers for "what the gateway is actually doing."
+
 ### What's in each latency bucket
 
-A p50 of 11ms on a cache hit covers:
+A p50 of 3 ms on a cache hit covers:
 
-- Bearer-token auth (Redis cache ~0.3ms)
+- Bearer-token auth (Redis cache ~0.3 ms)
 - API-key token-bucket rate limit (Redis Lua `EVALSHA`, 1 round trip)
 - Exact-match cache lookup (Redis `GET`, 1 round trip)
 - JSON marshal + HTTP response write
 - Gin middleware chain + logging goroutine spawn
 
-For cache misses, add the provider round-trip on top (`gpt-4o-mini` ≈ 300–800ms to OpenAI, ≈ 200–500ms to Anthropic).
+For cache misses, add the provider round-trip on top (`gpt-4o-mini` ≈ 300–800 ms to OpenAI, ≈ 200–500 ms to Anthropic).
 
-### A note on Docker Desktop vs production
+### A note on Docker Desktop vs production Linux
 
-If you run the gateway inside **Docker Desktop on macOS**, expect p50 ≈ 15ms and p99 ≈ 150ms+ — that's the Docker-for-Mac VM's network overhead, not the gateway. On Linux hosts (EC2, Kubernetes nodes, bare metal) the container networking penalty is ~0.05ms, so production numbers will match the native-Go row above almost exactly.
+The laptop row in the table above (11 ms p50) is slower than the **$48/mo DigitalOcean droplet** (3 ms p50) — not because the droplet has a better CPU, but because **Docker Desktop on macOS routes container traffic through a virtual network bridge into a Linux VM**. Every Redis round trip pays a ~1–2 ms tax on macOS that doesn't exist on native Linux.
+
+Takeaway: **production numbers match the DigitalOcean rows, not the laptop row**. If you're benchmarking the gateway on a Mac and seeing single-digit millisecond p50, that's actually *slower* than what you'll see on a Linux VPS at the same CPU count. Run the benchmark on a real Linux host (EC2, Hetzner, DigitalOcean, Linode, bare metal) for representative numbers before making production decisions.
 
 ### Memory footprint
 

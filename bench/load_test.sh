@@ -77,3 +77,17 @@ separator
 echo "Done. Compare p50/p99 between the two scenarios:"
 echo "  Scenario 1 (cache hit)  → measures gateway overhead only"
 echo "  Scenario 2 (cache miss) → measures full provider round-trip"
+echo
+echo "For authoritative server-side percentiles (per status code,"
+echo "excluding client network + hey overhead), query gateway_logs:"
+echo
+echo "  docker compose exec -T postgres psql -U llm0 -d llm0_gateway -c \\"
+echo "    \"SELECT status, cache_hit, count(*), \\"
+echo "            percentile_disc(0.5)  WITHIN GROUP (ORDER BY latency_ms) AS p50, \\"
+echo "            percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95, \\"
+echo "            percentile_disc(0.99) WITHIN GROUP (ORDER BY latency_ms) AS p99 \\"
+echo "     FROM gateway_logs \\"
+echo "     WHERE created_at > now() - interval '15 minutes' \\"
+echo "     GROUP BY status, cache_hit;\""
+echo
+echo "See bench/README.md → 'Interpreting results' for methodology."
