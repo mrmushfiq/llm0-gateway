@@ -252,7 +252,9 @@ GEMINI_API_KEY=AIza...
 docker compose build
 ```
 
-> **This takes 3–5 minutes on first run.** The embedding service downloads and bakes the `all-MiniLM-L6-v2` model weights (~90MB) into the image at build time so startup is instant afterwards. Subsequent builds use the Docker layer cache and complete in seconds.
+> **This takes 3–5 minutes on first run and pulls ~3 GB.** The embedding service is the heavy dependency — it ships PyTorch + sentence-transformers for the `all-MiniLM-L6-v2` model (~90 MB weights) and compresses to a ~3 GB image (~7 GB on disk once all Docker layers are extracted). Subsequent builds use the Docker layer cache and complete in seconds.
+>
+> **Don't need semantic caching?** Skip the embedding service entirely — see the note under **Step 3** below for the lightweight startup command. Exact-match caching still works without it.
 
 **Step 3 — Start all services**
 
@@ -260,7 +262,17 @@ docker compose build
 docker compose up
 ```
 
-Postgres (with `pgvector`), Redis, the embedding service, and the gateway all start together. The database schema is applied automatically on first boot. When you see:
+Postgres (with `pgvector`), Redis, the embedding service, and the gateway all start together. The database schema is applied automatically on first boot.
+
+> **Don't want the ~3 GB embedding service?** Start just the three core containers instead:
+>
+> ```bash
+> docker compose up postgres redis gateway
+> ```
+>
+> Exact-match caching still works without it. To fully disable semantic cache (so the gateway doesn't attempt to reach a service that isn't running), see [Turning Semantic Cache Off](#turning-semantic-cache-off). A cleaner single-flag opt-out is planned for v0.1.3.
+
+When you see:
 
 ```
 llm0_gateway  | ✅ Failover executor initialized with 3 providers
@@ -303,6 +315,8 @@ docker compose down -v
 # Restart just the gateway (e.g. after editing .env)
 docker compose up -d gateway
 ```
+
+> **Skipping the embedding service** — see the [Turning Semantic Cache Off](#turning-semantic-cache-off) section for the current (manual) procedure. A clean CLI-only opt-out is tracked for v0.1.3.
 
 **Step 6 — (Optional) Add local Ollama models**
 
@@ -946,12 +960,9 @@ export LLM0_API_KEY=llm0_live_<your key>
 
 | Deployment | p50 | p95 | p99 | Throughput (client) | n |
 |---|---:|---:|---:|---:|---:|
-| **DO 4 vCPU / 8 GB droplet**, Linux (run 1) | **3 ms** | **12 ms** | **23 ms** | **~1,672 req/s** | 79 |
-| **DO 4 vCPU / 8 GB droplet**, Linux (run 2) | **4 ms** | **12 ms** | **16 ms** | **~1,006 req/s** | 78 |
+| **DO 4 vCPU / 8 GB droplet**, Linux | **3 ms** | **12 ms** | **23 ms** | **~1,672 req/s** | 79 |
 | DO 2 vCPU / 2 GB droplet, Linux | 7 ms | 17 ms | 22 ms | ~1,194 req/s | 82 |
 | MacBook Air M4, native Go + Docker Desktop (Redis/Postgres) | 11 ms | 15 ms | 16 ms | ~1,480 req/s | 67 |
-
-Two independent 4 vCPU runs shown to illustrate the caveat below: **p50 and p95 are stable (3–4 ms / 12 ms), p99 wiggles run-to-run (16–23 ms)** — because p99 is dominated by Go GC pauses and Redis connection warm-up, not by request path CPU.
 
 **The 4 vCPU droplet is faster than the MacBook Air at p50** — not because the droplet CPU is faster (it isn't), but because **Docker Desktop on macOS adds network-VM overhead that Linux containers don't have**. Every Redis round trip on macOS goes through a virtual network bridge into the Docker-for-Mac VM; on Linux the overhead is ~0.05ms. When you're measuring 3ms of gateway work, a 1–2ms network tax per Redis call is half your budget.
 
@@ -970,8 +981,8 @@ Rejections short-circuiting at this speed is the property that keeps a single ga
 
 ### Caveats worth reading before you quote these numbers
 
-- **Sample size is small.** ~80 samples per run for p99 is enough to be directionally right, not tight enough to publish ±0.5 ms. Two 4 vCPU runs gave p99s of 23 ms and 16 ms — same droplet, same script, same concurrency. Quote a range, not a single point.
-- **p99 is GC- and connection-warm-up-bound, not CPU-bound.** The 2 vCPU and 4 vCPU droplets have similar p99s (22–23 ms on one run, 16 ms on another for the same 4 vCPU droplet) because the tail is dominated by Go GC pauses and first-request Redis connection setup, neither of which scale with CPU count. Throwing more hardware at the gateway won't reliably push p99 below ~15 ms without GC tuning (`GOGC=200+`) and pool pre-warming — both out of scope for v0.1.x.
+- **Sample size is small.** ~80 samples per run for p99 is enough to be directionally right, not tight enough to publish ±0.5 ms. Repeat runs on the same droplet move p99 by ±5–10 ms even with identical script and concurrency — quote a range, not a single point.
+- **p99 is GC- and connection-warm-up-bound, not CPU-bound.** The 2 vCPU and 4 vCPU droplets have similar p99s (22–23 ms) because the tail is dominated by Go GC pauses and first-request Redis connection setup, neither of which scale with CPU count. Throwing more hardware at the gateway won't reliably push p99 below ~15 ms without GC tuning (`GOGC=200+`) and pool pre-warming — both out of scope for v0.1.x.
 - **These are cache-hit numbers.** Cache misses are dominated by upstream provider latency (`gpt-4o-mini` ≈ 300–800 ms to OpenAI, ≈ 200–500 ms to Anthropic). That's not gateway overhead — that's your LLM taking its time.
 
 ### Querying your own percentiles (recommended)

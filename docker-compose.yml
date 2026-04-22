@@ -53,6 +53,12 @@ services:
   # The model (~90MB) is baked into the image at build time so startup is fast.
   # First build takes ~3-5 minutes while it downloads the model weights.
   # RAM: ~300MB. CPU-only — no GPU required.
+  #
+  # Footprint: ~3 GB image (PyTorch + sentence-transformers runtime), ~7 GB on
+  # disk once all Docker layers are extracted. If you don't need semantic cache,
+  # start without this service:
+  #   docker compose up -d postgres redis gateway
+  # Exact-match cache still works; semantic cache is disabled gracefully.
   embedding:
     build:
       context: ./embedding_service
