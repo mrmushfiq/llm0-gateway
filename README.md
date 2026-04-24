@@ -8,11 +8,53 @@
 A production-grade, self-hosted LLM gateway written in Go. One **OpenAI-compatible** API endpoint for **OpenAI**, **Anthropic**, **Google Gemini**, and **local Ollama models** — with configurable cloud/local failover, two-tier caching, streaming, per-key rate limiting, per-customer spend caps, and cost tracking out of the box.
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl -i http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer llm0_live_..." \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello!"}]}'
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"What is the capital of France?"}]}'
 ```
+
+Response:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+X-Provider: openai
+X-Cache-Hit: miss
+X-Cost-Usd: 0.000007
+X-Tokens-Prompt: 16
+X-Tokens-Completion: 7
+X-Tokens-Total: 23
+X-Ratelimit-Remaining: 59
+
+{
+  "id": "chatcmpl-DYDw0my3N2EzbjpPCwMrysQ6CZpTm",
+  "object": "chat.completion",
+  "model": "gpt-4o-mini-2024-07-18",
+  "choices": [{
+    "index": 0,
+    "message": { "role": "assistant", "content": "The capital of France is Paris." },
+    "finish_reason": "stop"
+  }],
+  "usage": { "prompt_tokens": 16, "completion_tokens": 7, "total_tokens": 23 },
+  "latency_ms": 4842,
+  "cost_usd": 0.0000066
+}
+```
+
+The **response body follows OpenAI's chat-completion schema** — drop-in for the official OpenAI SDK, LangChain, Vercel AI SDK, or any client that speaks OpenAI. The gateway adds two fields to the body (`latency_ms`, `cost_usd`) and seven `X-*` headers for observability without an SDK:
+
+| Header | What it tells you |
+|---|---|
+| `X-Provider` | which upstream served this call (`openai` / `anthropic` / `gemini` / `ollama`) — changes when failover kicks in |
+| `X-Cache-Hit` | `miss` / `exact` / `semantic` — paired with `X-Cache-Similarity` on semantic hits |
+| `X-Cost-Usd` | per-request cost in USD (6 decimals), `0.000000` on cache hits |
+| `X-Tokens-*` | token counts normalised across providers (Anthropic, Gemini, Ollama all reported the same way) |
+| `X-Ratelimit-Remaining` | tokens left in this API key's bucket, for client-side backpressure |
+
+On a failover, you'll also see `X-Failover: true` and `X-Original-Provider: <name>` — so your dashboards can chart "what got re-routed" without parsing gateway logs.
+
+> The `latency_ms: 4842` above is a **cache miss** — it includes OpenAI's full response time. Run the same request a second time and you'll see `X-Cache-Hit: exact`, `X-Cost-Usd: 0.000000`, and `latency_ms` in the single digits. That's the 3 ms p50 claim from the benchmark table below.
 
 Switch `gpt-4o-mini` for `claude-haiku-4-5-20251001`, `gemini-2.0-flash`, or any local Ollama model (`llama3.3`, `qwen2.5`, `gemma3`, …) — same endpoint, no code changes in your application.
 

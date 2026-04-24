@@ -134,6 +134,34 @@ full methodology, query, and Linux-vs-macOS comparison.
   - Keep it behind a flag (`OLLAMA_FILTER_EMPTY_CHUNKS=true` default) so
     users who actually want the raw Ollama byte-for-byte stream can opt
     out.
+- **Round `cost_usd` to 6 decimals at source.** Today the header path
+  formats `X-Cost-Usd` with `%.6f` (e.g. `0.000007`) but the response
+  body and streaming metadata frame write the raw `float64`, so users
+  see `"cost_usd": 0.0000065999999999999995` in JSON — ugly on its own,
+  and it disagrees with the matching header value on the same request.
+  Rounding once right after `CalculateCost(...)` returns aligns every
+  downstream consumer (`X-Cost-Usd` header, response body, SSE trailing
+  metadata frame, `gateway_logs.cost_usd`) without per-site boilerplate.
+  - Locations:
+    - `internal/gateway/handlers/chat.go:397` (post-`CalculateCost`) — round
+      `actualCost` once; `chat.go:470` body write and `chat.go:475` header
+      write then read from the same rounded value.
+    - `internal/gateway/handlers/chat_stream.go:225` (post-`CalculateCost`)
+      — same, feeds `chat_stream.go:239` metadata frame and
+      `chat_stream.go:321` full-response write.
+  - Proposed fix (one line in each location):
+    ```go
+    actualCost = math.Round(actualCost*1e6) / 1e6
+    ```
+  - Acceptance: `curl -i` shows `X-Cost-Usd` and body `cost_usd` with
+    identical values. Streaming `[DONE]`-preceding metadata frame
+    carries the same rounded value. `SELECT sum(cost_usd) FROM
+    gateway_logs` no longer accumulates IEEE drift across millions of
+    rows.
+  - Rationale for source-side rounding: 6 decimals = $1e-6 precision =
+    1/100th of a cent. Every real-world cap threshold (`daily_cap_usd`,
+    `monthly_cap_usd`) is quoted in USD with ≤4 decimal places, so no
+    enforcement code loses meaningful precision from the rounding.
 - **Scheduler heartbeat table** to close the v0.1.1 paper cut where
   `SELECT count(*) FROM system_logs` returns zero on a fresh install
   even though the scheduler is healthy. See
